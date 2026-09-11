@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use transport::Arrived;
 use transport::Directions;
 use transport::Transport;
-use transport::error::{Result, classify};
+use transport::error::{Result, classify, protocol_error};
+use transport::loopback::{FarEnd, Loopback};
 
 pub struct FileTransport {
     root: PathBuf,
@@ -86,6 +87,69 @@ fn file_uri(path: &Path) -> String {
         "file:///{}",
         path.display().to_string().replace(char::from(92), "/")
     )
+}
+
+impl FileTransport {
+    /// Both ends in one directory: send into it, read it back from the same
+    /// place. The self-contained case, and the reason file was first.
+    #[must_use]
+    pub fn loopback(root: impl Into<PathBuf>) -> Self {
+        Self::new(root)
+    }
+
+    /// One directory per thread: pairs driven at once from several threads
+    /// would otherwise pick up each other's file and report it as sent but
+    /// not returned (found at Harsh, 2026-09-10). Per thread rather than per
+    /// exchange so the directory is made once and the round stays as fast as
+    /// the file transport is.
+    fn thread_directory(&self) -> PathBuf {
+        self.root
+            .join(format!("t{:?}", std::thread::current().id()))
+    }
+}
+
+/// The directory a round drops into. Nothing waits: the round is in order.
+struct Directory(PathBuf);
+
+impl FarEnd for Directory {
+    fn address(&self) -> &'static str {
+        "pingpong"
+    }
+
+    fn take_one(self: Box<Self>) -> Result<Arrived> {
+        FileTransport::new(self.0)
+            .receive()?
+            .into_iter()
+            .next()
+            .ok_or_else(|| protocol_error("sent, but it did not come back"))
+    }
+}
+
+impl Loopback for FileTransport {
+    fn far_end(&self) -> Result<Box<dyn FarEnd>> {
+        let directory = self.thread_directory();
+        fs::create_dir_all(&directory)
+            .map_err(|e| classify("creating the exchange directory", &e))?;
+        Ok(Box::new(Directory(directory)))
+    }
+
+    fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
+        FileTransport::new(self.thread_directory()).send(address, payload)
+    }
+
+    fn unblock(&self, _address: &str) {}
+
+    /// In order on one thread: a directory does not listen, so the send goes
+    /// first and the read-back finds it.
+    fn round(&self, payload: &[u8]) -> Result<Arrived> {
+        let far = self.far_end()?;
+        self.send_to(far.address(), payload)?;
+        let arrived = far.take_one()?;
+        if arrived.bytes != payload {
+            return Err(protocol_error("sent, but what came back differs"));
+        }
+        Ok(arrived)
+    }
 }
 
 #[cfg(test)]
