@@ -142,13 +142,7 @@ impl Loopback for FileTransport {
     /// In order on one thread: a directory does not listen, so the send goes
     /// first and the read-back finds it.
     fn round(&self, payload: &[u8]) -> Result<Arrived> {
-        let far = self.far_end()?;
-        self.send_to(far.address(), payload)?;
-        let arrived = far.take_one()?;
-        if arrived.bytes != payload {
-            return Err(protocol_error("sent, but what came back differs"));
-        }
-        Ok(arrived)
+        self.round_in_order(payload)
     }
 }
 
