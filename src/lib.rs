@@ -113,7 +113,7 @@ struct Directory(PathBuf);
 
 impl FarEnd for Directory {
     fn address(&self) -> &'static str {
-        "pingpong"
+        "round-trip"
     }
 
     fn take_one(self: Box<Self>) -> Result<Arrived> {
