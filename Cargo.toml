@@ -20,6 +20,8 @@ path = "src/lib.rs"
 # otherwise, which is what lets this build on every target in
 # deployment-model.md without a cross-compilation story.
 transport = { package = "xmip-core-transport", git = "https://github.com/IlleNilsson/xmip-core-transport", branch = "main" }
+# A filesystem path as the path of a URI, written once for the estate.
+net = { package = "xmip-core-library-net", git = "https://github.com/IlleNilsson/xmip-core-library-net", branch = "main" }
 
 [lints.rust]
 unsafe_code = "forbid"
