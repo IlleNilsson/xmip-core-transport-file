@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use transport::Arrived;
 use transport::Directions;
 use transport::Transport;
-use transport::error::{Result, classify, protocol_error};
+use transport::arrived::next_arrival;
+use transport::error::{Result, classify};
+use transport::held::Held;
 use transport::loopback::{FarEnd, Loopback};
 
 pub struct FileTransport {
@@ -29,7 +31,9 @@ impl FileTransport {
     fn read_one(path: &Path) -> Result<Arrived> {
         let bytes = fs::read(path).map_err(|e| classify("reading a dropped file", &e))?;
 
-        Ok(Arrived::new(file_uri(path), bytes))
+        // `file://` and the path as `net::uri` writes it: `file:///C:/in/a.edi`.
+        let origin = format!("file://{}", net::uri::path_of(path));
+        Ok(Arrived::new(origin, bytes))
     }
 }
 
@@ -76,19 +80,6 @@ impl Transport for FileTransport {
     }
 }
 
-/// Render a path as a file URI.
-///
-/// A URI uses forward slashes on every platform, so a Windows path has to be
-/// converted rather than printed. `char::from(92)` is a backslash, written this
-/// way to keep the escape out of the literal.
-#[must_use]
-fn file_uri(path: &Path) -> String {
-    format!(
-        "file:///{}",
-        path.display().to_string().replace(char::from(92), "/")
-    )
-}
-
 impl FileTransport {
     /// Both ends in one directory: send into it, read it back from the same
     /// place. The self-contained case, and the reason file was first.
@@ -108,29 +99,19 @@ impl FileTransport {
     }
 }
 
-/// The directory a round drops into. Nothing waits: the round is in order.
-struct Directory(PathBuf);
-
-impl FarEnd for Directory {
-    fn address(&self) -> &'static str {
-        "round-trip"
-    }
-
-    fn take_one(self: Box<Self>) -> Result<Arrived> {
-        FileTransport::new(self.0)
-            .receive()?
-            .into_iter()
-            .next()
-            .ok_or_else(|| protocol_error("sent, but it did not come back"))
-    }
-}
-
 impl Loopback for FileTransport {
+    /// The directory a round drops into. Nothing waits: the round is in
+    /// order.
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
         let directory = self.thread_directory();
         fs::create_dir_all(&directory)
             .map_err(|e| classify("creating the exchange directory", &e))?;
-        Ok(Box::new(Directory(directory)))
+        Ok(Box::new(Held::new("round-trip", move || {
+            next_arrival(
+                FileTransport::new(directory).receive()?,
+                "sent, but it did not come back",
+            )
+        })))
     }
 
     fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
@@ -211,6 +192,10 @@ mod tests {
         let arrived = transport.receive().expect("receiving");
 
         assert!(!arrived[0].origin_uri.contains(char::from(92)));
+        assert!(
+            !arrived[0].origin_uri.starts_with("file:////"),
+            "three slashes, not four, before a Unix path"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
