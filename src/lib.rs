@@ -118,12 +118,10 @@ impl Loopback for FileTransport {
         FileTransport::new(self.thread_directory()).send(address, payload)
     }
 
-    fn unblock(&self, _address: &str) {}
-
     /// In order on one thread: a directory does not listen, so the send goes
     /// first and the read-back finds it.
-    fn round(&self, payload: &[u8]) -> Result<Arrived> {
-        self.round_in_order(payload)
+    fn exchanges_in_order(&self) -> bool {
+        true
     }
 }
 
