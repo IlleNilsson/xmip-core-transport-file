@@ -10,12 +10,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use transport::Arrived;
+use transport::Configured;
 use transport::Directions;
 use transport::Transport;
 use transport::arrived::next_arrival;
 use transport::error::{Result, classify};
 use transport::held::Held;
 use transport::loopback::{FarEnd, Loopback};
+use xcore::settings::{Read, Settings};
 
 pub struct FileTransport {
     root: PathBuf,
@@ -80,6 +82,16 @@ impl Transport for FileTransport {
     }
 }
 
+impl Configured for FileTransport {
+    /// The address is the directory: a Receive Location's drop directory, a
+    /// Send Location's target. Nothing else is read.
+    const SETTINGS: &'static Settings = &Settings::none(env!("CARGO_PKG_NAME"));
+
+    fn configured(address: &str, _settings: &Read) -> Result<Self> {
+        Ok(Self::new(address))
+    }
+}
+
 impl FileTransport {
     /// Both ends in one directory: send into it, read it back from the same
     /// place. The self-contained case, and the reason file was first.
@@ -140,6 +152,23 @@ mod tests {
         fs::create_dir_all(&dir).expect("creating the scratch directory");
 
         dir
+    }
+
+    #[test]
+    fn file_declares_it_takes_nothing_beyond_its_directory() {
+        use xcore::settings::{Applies, Given};
+        assert!(FileTransport::SETTINGS.settings.is_empty());
+        let transport = FileTransport::open("in", Applies::Receive, &[]).expect("configured");
+        assert_eq!(transport.root, PathBuf::from("in"));
+        let unknown = [("colour".to_string(), Given::Text("lime".to_string()))];
+        let refused = FileTransport::open("in", Applies::Receive, &unknown)
+            .err()
+            .expect("refused");
+        assert!(
+            refused.message.contains("\"colour\""),
+            "{}",
+            refused.message
+        );
     }
 
     #[test]
