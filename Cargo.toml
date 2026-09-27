@@ -20,6 +20,9 @@ path = "src/lib.rs"
 # otherwise, which is what lets this build on every target in
 # deployment-model.md without a cross-compilation story.
 transport = { package = "xmip-core-transport", git = "https://github.com/IlleNilsson/xmip-core-transport", branch = "main" }
+# The settings this technology declares (xcore::settings), read through
+# transport::Configured (ADR-0064, amendment 2026-09-26).
+xcore = { package = "xmip-core", git = "https://github.com/IlleNilsson/xmip-core", branch = "main" }
 # A filesystem path as the path of a URI, written once for the estate.
 net = { package = "xmip-core-library-net", git = "https://github.com/IlleNilsson/xmip-core-library-net", branch = "main" }
 
@@ -33,3 +36,6 @@ missing_errors_doc = "warn"
 missing_panics_doc = "warn"
 unwrap_used = "warn"
 expect_used = "allow"
+
+[profile.dev.package."*"]
+opt-level = 3
