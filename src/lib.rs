@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Mutex, PoisonError};
 use std::time::SystemTime;
 
 use transport::Acknowledgement;
@@ -64,8 +64,8 @@ type Stamp = (u64, Option<SystemTime>);
 type Stamps = HashMap<PathBuf, Stamp>;
 
 /// The refused files a Location leaves where they lie, each as it was
-/// refused.
-type Refused = Arc<Mutex<Stamps>>;
+/// refused: the capability's one memory of them (`transport::refused`).
+type Refused = transport::Refused<PathBuf, Stamp>;
 
 pub struct FileTransport {
     root: PathBuf,
@@ -129,7 +129,7 @@ impl Hold {
             Verdict::Refused(_) => {
                 let dropped = give_back(&self.claimed)?;
                 if let Some(stamp) = stamp(&dropped) {
-                    lock(&self.refused).insert(dropped, stamp);
+                    self.refused.remember(dropped, stamp);
                 }
                 Ok(())
             }
@@ -170,29 +170,27 @@ impl Transport for FileTransport {
             Err(e) => return Err(classify("reading the drop directory", &e)),
         };
 
-        let mut arrived = Vec::new();
-        // What this listing found and did not take, and what is still
-        // refused after it: a file gone or written again is forgotten, so
-        // neither memory is ever more than the directory holds.
-        let mut seen = Stamps::new();
-        let mut still = Stamps::new();
-        let mut listed = lock(&self.listed);
-        let mut refused = lock(&self.refused);
-
+        let mut found = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|e| classify("listing the drop directory", &e))?;
             let path = entry.path();
+            if let Some(stamp) = stamp(&path)
+                && !is_claimed(&path)
+            {
+                found.push((path, stamp));
+            }
+        }
+        // A file still as it was refused is left out; a file gone or
+        // written again is forgotten, as what this listing did not take is,
+        // so neither memory is ever more than the directory holds.
+        let found = self
+            .refused
+            .sift(found, |(path, _)| path, |(_, stamp)| Some(*stamp));
+        let mut arrived = Vec::new();
+        let mut seen = Stamps::new();
+        let mut listed = lock(&self.listed);
 
-            let Some(stamp) = stamp(&path) else {
-                continue;
-            };
-            if is_claimed(&path) {
-                continue;
-            }
-            if let Some(was) = refused.remove(&path).filter(|was| *was == stamp) {
-                still.insert(path, was);
-                continue;
-            }
+        for (path, stamp) in found {
             // Unchanged since the last listing, and still so once its turn
             // is held: finished, and the file that was found.
             let finished = listed.get(&path) == Some(&stamp);
@@ -202,7 +200,7 @@ impl Transport for FileTransport {
                 .flatten()
             {
                 Some(claimed) => {
-                    arrived.push(Self::arrived(&path, claimed, Arc::clone(&self.refused)));
+                    arrived.push(Self::arrived(&path, claimed, self.refused.clone()));
                 }
                 None => {
                     seen.insert(path, stamp);
@@ -211,7 +209,6 @@ impl Transport for FileTransport {
         }
 
         *listed = seen;
-        *refused = still;
         Ok(arrived)
     }
 
