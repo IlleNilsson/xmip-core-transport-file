@@ -30,10 +30,11 @@
 //! A name carrying the mark, or a turn's name, is never an arrival.
 //!
 //! **What the rename costs**, as the amendment says: a node that dies after
-//! the rename leaves a claimed file behind, so a node that starts returns
-//! every claim its own name records to the drop directory, and removes any
-//! turn it held ([`Claimant::recover`]): whatever it held before, nothing
-//! holds now.
+//! the rename leaves a claimed file behind, so a node that starts finds
+//! every claim its own name records in the drop directory and returns it,
+//! and removes any turn it held ([`Claimant::recover`]): whatever it held
+//! before, nothing holds now. A claim whose dropped name a newer file has
+//! taken waits for it (`waiting.rs`), as every return does.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -96,21 +97,20 @@ impl Claimant {
         renamed.then_some(claimed)
     }
 
-    /// Every file this claimant left claimed in `root`, returned to it
-    /// under the name it was dropped with, and every turn it left, removed:
-    /// what a node does as it starts, since whatever it held before,
-    /// nothing holds now. A claim whose dropped name a newer file has taken
-    /// stays claimed.
+    /// Every file this claimant left claimed in `root`, to be returned to
+    /// it under the name it was dropped with, and every turn it left,
+    /// removed: what a node does as it starts, since whatever it held
+    /// before, nothing holds now.
     ///
     /// # Errors
-    /// Where `root` could not be read, or a claim could not be returned.
+    /// Where `root` could not be read.
     pub(crate) fn recover(&self, root: &Path) -> Result<Vec<PathBuf>> {
         let entries = match fs::read_dir(root) {
             Ok(entries) => entries,
             Err(ref e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(classify("reading the drop directory", &e)),
         };
-        let mut returned = Vec::new();
+        let mut left = Vec::new();
         for entry in entries {
             let path = entry
                 .map_err(|e| classify("listing the drop directory", &e))?
@@ -121,16 +121,11 @@ impl Claimant {
                 }
                 continue;
             }
-            if claim_of(&path).is_none_or(|claim| claim.claimant != self.0) {
-                continue;
-            }
-            match give_back(&path) {
-                Ok(original) => returned.push(original),
-                Err(taken) if taken.retryable => {}
-                Err(failed) => return Err(failed),
+            if claim_of(&path).is_some_and(|claim| claim.claimant == self.0) {
+                left.push(path);
             }
         }
-        Ok(returned)
+        Ok(left)
     }
 }
 
@@ -176,7 +171,7 @@ pub(crate) fn is_claimed(path: &Path) -> bool {
 ///
 /// # Errors
 /// Retryable where a file of the dropped name is there again: the claimed
-/// one stays claimed. Otherwise as the file system refused.
+/// one is left as it is. Otherwise as the file system refused.
 pub(crate) fn give_back(claimed: &Path) -> Result<PathBuf> {
     let dropped = claim_of(claimed)
         .map(|claim| claimed.with_file_name(claim.dropped))
@@ -189,8 +184,7 @@ pub(crate) fn give_back(claimed: &Path) -> Result<PathBuf> {
         Ok(()) => fs::remove_file(claimed),
         Err(ref e) if e.kind() == io::ErrorKind::AlreadyExists => {
             return Err(TransportError::retryable(format!(
-                "returning {}: a file of that name was dropped since, and the claimed one \
-                 stays claimed",
+                "returning {}: a file of that name was dropped since",
                 dropped.display()
             )));
         }
