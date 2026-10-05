@@ -28,8 +28,15 @@
 //! the same name — another length or another modification time — is a new
 //! arrival. `Failed`, or no verdict at all, returns it, and a later receive
 //! finds it again.
+//!
+//! **A return never waits for a restart.** A file is never returned over
+//! one dropped under its name since; such a file waits, held under its
+//! claimed name with why ([`FileTransport::held`]), and goes back as soon
+//! as the name is free: once this Location consumes the newer file, or at
+//! the next receive (`waiting.rs`).
 
 mod claim;
+mod waiting;
 
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -53,7 +60,10 @@ use transport::held::Held;
 use transport::loopback::{FarEnd, Loopback};
 use xcore::settings::{Read, Settings};
 
-use crate::claim::{Claimant, give_back, is_claimed};
+use crate::claim::{Claimant, is_claimed};
+use crate::waiting::Waiting;
+
+pub use crate::waiting::HeldFile;
 
 /// A file as a listing found it: its length and its modification time.
 /// The same stamp at two listings is a finished file; the same stamp as
@@ -74,6 +84,7 @@ pub struct FileTransport {
     /// other half.
     listed: Mutex<Stamps>,
     refused: Refused,
+    waiting: Waiting,
 }
 
 impl FileTransport {
@@ -84,20 +95,30 @@ impl FileTransport {
             claimant: Claimant::process(),
             listed: Mutex::default(),
             refused: Refused::default(),
+            waiting: Waiting::default(),
         }
+    }
+
+    /// The claimed files this Location could not return yet, since a file
+    /// was dropped under the same name meanwhile: where each lies, and
+    /// why. Each goes back as soon as its name is free.
+    #[must_use]
+    pub fn held(&self) -> Vec<HeldFile> {
+        self.waiting.held()
     }
 
     /// One claimed file: read as the runtime asks, deleted on `Accepted`,
     /// returned and remembered as refused on `Refused`, returned on
     /// `Failed` or when let go without a verdict.
-    fn arrived(dropped: &Path, claimed: PathBuf, refused: Refused) -> Arrived {
+    fn arrived(&self, dropped: &Path, claimed: PathBuf) -> Arrived {
         // `file://` and the dropped path as `net::uri` writes it:
         // `file:///C:/in/a.edi`.
         let origin = format!("file://{}", net::uri::path_of(dropped));
         let read = claimed.clone();
         let hold = Hold {
             claimed,
-            refused,
+            refused: self.refused.clone(),
+            waiting: self.waiting.clone(),
             told: false,
         };
         let acknowledgement = Acknowledgement::deferred(move |verdict| hold.tell(verdict));
@@ -114,6 +135,7 @@ impl FileTransport {
 struct Hold {
     claimed: PathBuf,
     refused: Refused,
+    waiting: Waiting,
     told: bool,
 }
 
@@ -121,19 +143,18 @@ impl Hold {
     fn tell(mut self, verdict: Verdict) -> Result<()> {
         self.told = true;
         match verdict {
-            Verdict::Accepted => match fs::remove_file(&self.claimed) {
-                // Gone already: consumed, which is what was asked.
-                Err(ref e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-                done => done.map_err(|e| classify("deleting a received file", &e)),
-            },
-            Verdict::Refused(_) => {
-                let dropped = give_back(&self.claimed)?;
-                if let Some(stamp) = stamp(&dropped) {
-                    self.refused.remember(dropped, stamp);
+            Verdict::Accepted => {
+                match fs::remove_file(&self.claimed) {
+                    // Gone already: consumed, which is what was asked.
+                    Err(ref e) if e.kind() == io::ErrorKind::NotFound => {}
+                    done => done.map_err(|e| classify("deleting a received file", &e))?,
                 }
+                // Its dropped name is free now: a file waiting for it goes back.
+                self.waiting.settle(&self.refused);
                 Ok(())
             }
-            Verdict::Failed => give_back(&self.claimed).map(drop),
+            Verdict::Refused(_) => self.waiting.give_back(&self.claimed, Some(&self.refused)),
+            Verdict::Failed => self.waiting.give_back(&self.claimed, None),
         }
     }
 }
@@ -143,7 +164,7 @@ impl Drop for Hold {
     /// back where it was dropped.
     fn drop(&mut self) {
         if !self.told {
-            let _ = give_back(&self.claimed);
+            let _ = self.waiting.give_back(&self.claimed, None);
         }
     }
 }
@@ -162,6 +183,9 @@ impl Transport for FileTransport {
     }
 
     fn receive(&self) -> Result<Vec<Arrived>> {
+        // A held file whose name was freed since goes back first, and is
+        // listed with the rest.
+        self.waiting.settle(&self.refused);
         let entries = match fs::read_dir(&self.root) {
             Ok(entries) => entries,
             // A drop directory that does not exist yet is not a failure. It is
@@ -200,7 +224,7 @@ impl Transport for FileTransport {
                 .flatten()
             {
                 Some(claimed) => {
-                    arrived.push(Self::arrived(&path, claimed, self.refused.clone()));
+                    arrived.push(self.arrived(&path, claimed));
                 }
                 None => {
                     seen.insert(path, stamp);
@@ -248,7 +272,7 @@ impl ResourceClaim for FileTransport {
     }
 
     fn release(&self, claimed: Claimed) -> Result<()> {
-        give_back(Path::new(&claimed.token)).map(drop)
+        self.waiting.give_back(Path::new(&claimed.token), None)
     }
 }
 
@@ -277,10 +301,14 @@ impl Configured for FileTransport {
     /// Claims made in `node`'s name from here on, and every claim that name
     /// still holds in the directory returned to it: the node is starting,
     /// so whatever it held before, nothing holds now (ADR-0024, amendment
-    /// 2026-09-26).
+    /// 2026-09-26). One whose dropped name a newer file has taken is held
+    /// until the name is free.
     fn on_node(mut self, node: &NodeLocation) -> Result<Self> {
         self.claimant = Claimant::of(node);
-        self.claimant.recover(&self.root)?;
+        for claimed in self.claimant.recover(&self.root)? {
+            // Held where it cannot go back now, and visible as such.
+            let _ = self.waiting.give_back(&claimed, None);
+        }
         Ok(self)
     }
 }
@@ -628,6 +656,104 @@ mod tests {
         assert!(names(&dir).is_empty(), "an accepted file is deleted");
         assert!(transport.receive().expect("receiving").is_empty());
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The bytes of the one arrival two listings of `transport` take.
+    fn the_one(transport: &FileTransport) -> Vec<u8> {
+        let mut arrived = settled(transport);
+        assert_eq!(arrived.len(), 1);
+        arrived.remove(0).taken().expect("taken").bytes
+    }
+
+    #[test]
+    fn a_return_kept_from_its_name_goes_back_once_the_newer_file_is_consumed() {
+        let dir = scratch("file-held-accepted");
+        let transport = on(&dir, 0);
+        transport.send("order.edi", b"old").expect("sending");
+        let mut arrived = settled(&transport);
+        transport
+            .send("order.edi", b"new")
+            .expect("a newer file, same name");
+
+        let told = arrived.remove(0).failed().expect_err("not returned now");
+        assert!(told.retryable, "{}", told.message);
+        let held = transport.held();
+        assert_eq!(held.len(), 1, "visible as held: {held:?}");
+        assert!(held[0].why.contains("dropped since"), "{}", held[0].why);
+        assert!(
+            names(&dir).contains(
+                held[0]
+                    .claimed
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .expect("a name")
+            )
+        );
+
+        assert_eq!(the_one(&transport), b"new", "the newer file is received");
+        assert_eq!(
+            names(&dir),
+            BTreeSet::from(["order.edi".to_string()]),
+            "its name freed, the older goes back at once, no restart"
+        );
+        assert!(transport.held().is_empty());
+        assert_eq!(the_one(&transport), b"old", "and is received again");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_refused_return_kept_from_its_name_goes_back_refused_once_it_is_free() {
+        let dir = scratch("file-held-refused");
+        let transport = on(&dir, 0);
+        transport.send("order.edi", b"old").expect("sending");
+        let mut arrived = settled(&transport);
+        transport
+            .send("order.edi", b"new")
+            .expect("a newer file, same name");
+        let refusal = arrived.remove(0).refused(Refusal::Unidentified);
+        assert!(refusal.is_err_and(|told| told.retryable));
+        assert!(transport.held().iter().all(|file| file.refused));
+
+        // Freed by somebody else: the next receive returns it.
+        fs::remove_file(dir.join("order.edi")).expect("the newer file taken away");
+        assert!(transport.receive().expect("receiving").is_empty());
+        assert!(transport.held().is_empty());
+        assert_eq!(fs::read(dir.join("order.edi")).expect("returned"), b"old");
+        for _ in 0..3 {
+            assert!(
+                transport.receive().expect("receiving").is_empty(),
+                "returned, it is remembered as refused"
+            );
+        }
+        assert_eq!(
+            the_one(&on(&dir, 1)),
+            b"old",
+            "another node finds it, not lost"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_starting_node_holds_a_claim_whose_name_is_taken_until_it_is_free() {
+        let dir = scratch("file-held-start");
+        let sender = FileTransport::new(&dir);
+        sender.send("order.edi", b"old").expect("sending");
+        std::mem::forget(settled(&on(&dir, 0)));
+        sender
+            .send("order.edi", b"new")
+            .expect("a newer file, same name");
+
+        let restarted = on(&dir, 0);
+        assert_eq!(restarted.held().len(), 1, "held, and visible as held");
+        assert_eq!(names(&dir).len(), 2);
+        assert_eq!(the_one(&restarted), b"new");
+        assert!(
+            restarted.held().is_empty(),
+            "returned once the newer was consumed"
+        );
+        assert_eq!(the_one(&restarted), b"old");
+        assert!(names(&dir).is_empty());
         fs::remove_dir_all(&dir).ok();
     }
 

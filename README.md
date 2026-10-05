@@ -33,7 +33,7 @@ The node is the one the runtime names as it builds the transport
 a node that starts returns to the drop directory every claim its name still
 records there, and removes any turn it held: whatever it held before, nothing
 holds now. A file returned is linked back under its dropped name, never over
-a file dropped there since; where one was, the claim stays claimed. A
+a file dropped there since; where one was, it waits (below). A
 transport built outside a node — a loopback, a test — claims in its
 process's name, and nothing returns those claims. Until 2026-10-03 the file
 transport listed and opened files with no claim, so two nodes could take
@@ -55,6 +55,23 @@ another node, receives a refused file once more, and refuses it again.
 `Failed`, or an arrival let go without a verdict, returns it, and a later
 receive finds it again. Until 2026-10-02 `receive` read every file whole
 into memory; until 2026-10-03 `Refused` deleted the file.
+
+## A return kept from its name
+
+A file goes back under its dropped name on `Refused`, on `Failed`, let go
+without a verdict, released, or found claimed by its own node as it starts.
+Where a newer file has taken that name meanwhile, it cannot go back yet, and
+nothing consumed it: what arrived is kept until the receive cycle's verdict,
+and a refusal keeps it still (ADR-0013, runtime-model section 5). It is then
+held under its claimed name, with why, and goes back as soon as the name is
+free — right after the Location consumes a file (`Accepted` frees its
+dropped name), and at every receive, before the listing, for a name freed by
+anything else. Returned, it is an arrival again; one refused is remembered as
+refused first, as it would have been had it gone back at once. Meanwhile
+`FileTransport::held` lists each held file — where it lies and why — and the
+verdict's telling that could not return it fails retryable with the same
+why. Until 2026-10-05 such a file stayed claimed, skipped by every receive,
+until its node started again.
 
 ## Toolchain
 
