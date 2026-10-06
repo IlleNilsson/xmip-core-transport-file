@@ -73,6 +73,19 @@ verdict's telling that could not return it fails retryable with the same
 why. Until 2026-10-05 such a file stayed claimed, skipped by every receive,
 until its node started again.
 
+A return is a hard link under the dropped name, which the file system makes
+only where that name is free, and then the claimed name removed. Nothing
+else returns a file: a rename replaces what it lands on (`std::fs::rename`
+is `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` on Windows, `rename(2)` on
+Unix), so a rename made after finding the name free loses a file a producer
+drops between the two, and the renames that refuse (`MoveFileExW` without
+the flag, `renameat2` with `RENAME_NOREPLACE`) are C calls this crate does
+not make (ADR-0050). On a file system that makes no hard link — FAT, exFAT,
+some network shares — a returned file is therefore held the same way, its
+why saying the file system made no link, and stays held there. Until
+2026-10-06 such a return renamed the file back after finding the name free,
+and could replace a file dropped in between.
+
 ## Toolchain
 
 `rust-toolchain.toml` pins the toolchain for the whole estate. Do not change it
