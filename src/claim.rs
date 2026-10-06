@@ -35,6 +35,11 @@
 //! and removes any turn it held ([`Claimant::recover`]): whatever it held
 //! before, nothing holds now. A claim whose dropped name a newer file has
 //! taken waits for it (`waiting.rs`), as every return does.
+//!
+//! **A return is a hard link**, made only where the dropped name is free,
+//! then the claimed name removed ([`give_back`]). Where the file system
+//! makes no hard link the file waits as well: a rename replaces what it
+//! lands on, so it could lose a file dropped under that name meanwhile.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -171,28 +176,107 @@ pub(crate) fn is_claimed(path: &Path) -> bool {
 ///
 /// # Errors
 /// Retryable where a file of the dropped name is there again: the claimed
-/// one is left as it is. Otherwise as the file system refused.
+/// one is left as it is. Where the file system makes no hard link, the
+/// claimed one is left as it is too, and the error says so. Otherwise as
+/// the file system refused.
 pub(crate) fn give_back(claimed: &Path) -> Result<PathBuf> {
+    give_back_by(claimed, |from, to| fs::hard_link(from, to))
+}
+
+/// [`give_back`], linking through `link`: a test hands in a file system
+/// that makes no hard link.
+fn give_back_by(
+    claimed: &Path,
+    link: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> Result<PathBuf> {
     let dropped = claim_of(claimed)
         .map(|claim| claimed.with_file_name(claim.dropped))
         .ok_or_else(|| {
             TransportError::permanent(format!("{} is not a claimed file", claimed.display()))
         })?;
     // A hard link is made only where the name is free, so nothing dropped
-    // since is overwritten, as a rename would.
-    let returned = match fs::hard_link(claimed, &dropped) {
-        Ok(()) => fs::remove_file(claimed),
+    // since is overwritten. It is the only way back: a rename replaces what
+    // it lands on — on Windows `std::fs::rename` is `MoveFileExW` with
+    // `MOVEFILE_REPLACE_EXISTING`, on Unix `rename(2)` — so a rename after
+    // finding the name free loses a file a producer drops between the two.
+    // The refusing renames (`MoveFileExW` without the flag, `renameat2`
+    // with `RENAME_NOREPLACE`) are C calls, and this crate forbids unsafe
+    // code (ADR-0050). So where no link is made the file stays claimed and
+    // waits (`waiting.rs`): held, never risked.
+    match link(claimed, &dropped) {
+        Ok(()) => {}
         Err(ref e) if e.kind() == io::ErrorKind::AlreadyExists => {
             return Err(TransportError::retryable(format!(
                 "returning {}: a file of that name was dropped since",
                 dropped.display()
             )));
         }
-        // A file system without hard links: renamed back where the name
-        // is still free.
-        Err(_) if !dropped.exists() => fs::rename(claimed, &dropped),
-        Err(e) => Err(e),
-    };
-    returned.map_err(|e| classify("returning a claimed file", &e))?;
+        Err(e) if claimed.exists() => {
+            return Err(TransportError::retryable(format!(
+                "returning {}: the file system made no hard link ({e}), and only a link \
+                 never replaces a file dropped since",
+                dropped.display()
+            )));
+        }
+        Err(e) => return Err(classify("returning a claimed file", &e)),
+    }
+    fs::remove_file(claimed).map_err(|e| classify("returning a claimed file", &e))?;
     Ok(dropped)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A claimed file `order.edi` in a fresh scratch directory, holding
+    /// `claimed`.
+    fn claimed_in(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("xmip-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("creating the scratch directory");
+        let claimed = dir.join(format!("order.edi{MARK}process-1.1"));
+        fs::write(&claimed, b"claimed").expect("writing the claimed file");
+        claimed
+    }
+
+    #[test]
+    fn a_name_taken_before_the_return_is_never_replaced() {
+        let claimed = claimed_in("file-give-back-taken");
+        let dropped = claimed.with_file_name("order.edi");
+        fs::write(&dropped, b"newer").expect("a producer drops a newer file");
+
+        let refused = give_back(&claimed).expect_err("not returned");
+
+        assert!(
+            refused.message.contains("dropped since"),
+            "{}",
+            refused.message
+        );
+        assert_eq!(fs::read(&dropped).expect("the newer file"), b"newer");
+        assert_eq!(fs::read(&claimed).expect("still claimed"), b"claimed");
+        let _ = fs::remove_dir_all(claimed.parent().expect("its directory"));
+    }
+
+    #[test]
+    fn without_hard_links_a_name_taken_during_the_return_is_never_replaced() {
+        let claimed = claimed_in("file-give-back-no-link");
+        let dropped = claimed.with_file_name("order.edi");
+
+        // The file system makes no link, and a producer drops a newer file
+        // just as the return finds out: where a rename once followed.
+        let refused = give_back_by(&claimed, |_, to| {
+            fs::write(to, b"newer").expect("a producer drops a newer file");
+            Err(io::Error::from(io::ErrorKind::Unsupported))
+        })
+        .expect_err("not returned");
+
+        assert!(
+            refused.message.contains("no hard link"),
+            "{}",
+            refused.message
+        );
+        assert_eq!(fs::read(&dropped).expect("the newer file"), b"newer");
+        assert_eq!(fs::read(&claimed).expect("still claimed"), b"claimed");
+        let _ = fs::remove_dir_all(claimed.parent().expect("its directory"));
+    }
 }
