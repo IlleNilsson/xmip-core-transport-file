@@ -36,6 +36,7 @@
 //! the next receive (`waiting.rs`).
 
 mod claim;
+mod loopback;
 mod waiting;
 
 use std::collections::HashMap;
@@ -52,12 +53,9 @@ use transport::Directions;
 use transport::NodeLocation;
 use transport::Transport;
 use transport::Verdict;
-use transport::arrived::next_arrival;
 use transport::body::opened;
 use transport::claim::{Artefact, Claimed, ResourceClaim};
 use transport::error::{Result, TransportError, classify};
-use transport::held::Held;
-use transport::loopback::{FarEnd, Loopback};
 use xcore::settings::{Read, Settings};
 
 use crate::claim::{Claimant, is_claimed};
@@ -115,6 +113,7 @@ impl FileTransport {
         // `file:///C:/in/a.edi`.
         let origin = format!("file://{}", net::uri::path_of(dropped));
         let read = claimed.clone();
+        let owned = owner(&claimed);
         let hold = Hold {
             claimed,
             refused: self.refused.clone(),
@@ -126,8 +125,32 @@ impl FileTransport {
         // one handle per file being read, not one per file listed.
         let body =
             opened(move || File::open(&read).map_err(|e| classify("opening a dropped file", &e)));
+        // Found waiting in a folder this Location watches (ADR-0019 clause 8).
         Arrived::new(origin, body, acknowledgement)
+            .detected()
+            .observing_all(owned)
     }
+}
+
+/// Who owns the file at `path` and what it permits, as the system says
+/// without unsafe code: on Unix its user and group ids and its permission
+/// bits; nothing on Windows, whose owner is a security descriptor only an
+/// unsafe call reads.
+#[cfg(unix)]
+fn owner(path: &Path) -> Vec<(String, String)> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path).map_or_else(
+        |_| Vec::new(),
+        |metadata| {
+            transport::arrival_identity::file_owner(metadata.uid(), metadata.gid(), metadata.mode())
+        },
+    )
+}
+
+/// Nothing: see the Unix `owner`.
+#[cfg(not(unix))]
+fn owner(_: &Path) -> Vec<(String, String)> {
+    Vec::new()
 }
 
 /// A claimed file held through its receive cycle: told its verdict once,
@@ -313,60 +336,15 @@ impl Configured for FileTransport {
     }
 }
 
-impl FileTransport {
-    /// Both ends in one directory: send into it, read it back from the same
-    /// place. The self-contained case, and the reason file was first.
-    #[must_use]
-    pub fn loopback(root: impl Into<PathBuf>) -> Self {
-        Self::new(root)
-    }
-
-    /// One directory per thread: pairs driven at once from several threads
-    /// would otherwise pick up each other's file and report it as sent but
-    /// not returned (found at Harsh, 2026-09-10). Per thread rather than per
-    /// exchange so the directory is made once and the round stays as fast as
-    /// the file transport is.
-    fn thread_directory(&self) -> PathBuf {
-        self.root
-            .join(format!("t{:?}", std::thread::current().id()))
-    }
-}
-
-impl Loopback for FileTransport {
-    /// The directory a round drops into. Nothing waits: the round is in
-    /// order, so the file is whole when the far end lists it, and its
-    /// second listing takes it.
-    fn far_end(&self) -> Result<Box<dyn FarEnd>> {
-        let directory = self.thread_directory();
-        fs::create_dir_all(&directory)
-            .map_err(|e| classify("creating the exchange directory", &e))?;
-        Ok(Box::new(Held::new("round-trip", move || {
-            let far = FileTransport::new(directory);
-            // The first listing finds the file; the stability check takes
-            // it at the second.
-            far.receive()?;
-            next_arrival(far.receive()?, "sent, but it did not come back")?.taken()
-        })))
-    }
-
-    fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
-        FileTransport::new(self.thread_directory()).send(address, payload)
-    }
-
-    /// In order on one thread: a directory does not listen, so the send goes
-    /// first and the read-back finds it.
-    fn exchanges_in_order(&self) -> bool {
-        true
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use context::property::FILE_MODE;
     use std::collections::BTreeSet;
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
     use transport::Refusal;
+    use transport::loopback::Loopback;
     use xcore::settings::Applies;
 
     fn scratch(label: &str) -> PathBuf {
@@ -471,6 +449,7 @@ mod tests {
         let mut arrived = settled(&transport);
 
         assert_eq!(arrived.len(), 1);
+        assert_eq!(arrived[0].arriving(), xcore::Arriving::Detected);
         let taken = arrived.remove(0).taken().expect("taken");
         assert_eq!(taken.bytes, b"ISA*00*");
         assert!(taken.origin_uri.starts_with("file:///"));
@@ -792,6 +771,22 @@ mod tests {
             b"ISA*00*"
         );
         assert_eq!(settled(&restarted).len(), 1, "and received again");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_round_says_who_owns_the_file_where_the_system_says() {
+        let dir = scratch("file-round-identity");
+        let taken = FileTransport::loopback(&dir)
+            .round(b"who sent this")
+            .expect("a round");
+        assert!(taken.origin_uri.starts_with("file:///"), "{taken:?}");
+        // The round itself holds the arrival to what the transport declares.
+        assert_eq!(
+            taken.observation(FILE_MODE).is_some(),
+            cfg!(unix),
+            "{taken:?}"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 }
