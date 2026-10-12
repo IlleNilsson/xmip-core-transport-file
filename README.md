@@ -9,6 +9,20 @@ Lifted out of the capability crate on 2026-09-07, where it had lived as
 the trait, the error vocabulary and the shared wire helpers; nothing in it names
 a protocol.
 
+## Polled
+
+A receive lists the drop directory and returns at once, whatever it found
+(`Transport::waiting` is `Polled`). After a receive that found nothing the
+runtime waits the node's poll interval — `[tuning] receive_poll`, a wait a
+stop ends at once — before it lists again, so an idle Location costs one
+listing per interval and never a spin (runtime-model section 5, *How a
+receive runs*). A file is taken by the listing after the one that first
+found it unchanged (below), so it waits about one interval. The file system's
+change notification — `ReadDirectoryChangesW`, inotify, `FSEvents` — would
+let the receive wait for a change instead; it is not used yet. Until
+2026-10-12 the runtime listed again at once, and an idle Location listed
+its directory without pause.
+
 ## The claim
 
 A file is taken once it is finished, and by one node (ADR-0024). A listing

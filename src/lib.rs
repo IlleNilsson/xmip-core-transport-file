@@ -207,6 +207,10 @@ impl Transport for FileTransport {
         transport::Arrivals::Ordered("a receive lists again what is not yet told")
     }
 
+    fn waiting(&self) -> transport::Waiting {
+        transport::Waiting::Polled("a receive lists the drop directory and returns")
+    }
+
     fn receive(&self) -> Result<Vec<Arrived>> {
         // A held file whose name was freed since goes back first, and is
         // listed with the rest.
