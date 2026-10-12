@@ -86,6 +86,23 @@ why saying the file system made no link, and stays held there. Until
 2026-10-06 such a return renamed the file back after finding the name free,
 and could replace a file dropped in between.
 
+## Send
+
+A send writes the file whole beside its target, in the same directory, under
+a name no listing takes, then syncs it and renames it over the target in one
+step, so a receiver finds the target as it was before or whole, never half
+written:
+
+```text
+order.edi.xmip-sending.<process id>.<count in the process>.<nanoseconds since 1970>
+```
+
+A file already of the target's name is replaced: one Journey after another to
+a fixed name leaves the last one's file. Where the write, the sync or the
+rename fails, the written file is removed and the target is left as it was.
+Until 2026-10-12 a send wrote the target in place, and a receiver could take
+it half written.
+
 ## Toolchain
 
 `rust-toolchain.toml` pins the toolchain for the whole estate. Do not change it
