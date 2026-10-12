@@ -37,6 +37,7 @@
 
 mod claim;
 mod loopback;
+mod sending;
 mod waiting;
 
 use std::collections::HashMap;
@@ -59,6 +60,7 @@ use transport::error::{Result, TransportError, classify};
 use xcore::settings::{Read, Settings};
 
 use crate::claim::{Claimant, is_claimed};
+use crate::sending::is_sending;
 use crate::waiting::Waiting;
 
 pub use crate::waiting::HeldFile;
@@ -222,7 +224,7 @@ impl Transport for FileTransport {
             let entry = entry.map_err(|e| classify("listing the drop directory", &e))?;
             let path = entry.path();
             if let Some(stamp) = stamp(&path)
-                && !is_claimed(&path)
+                && is_arrival(&path)
             {
                 found.push((path, stamp));
             }
@@ -259,6 +261,10 @@ impl Transport for FileTransport {
         Ok(arrived)
     }
 
+    /// `bytes` as the file `target` in the directory, written whole beside
+    /// it and renamed into place, so no receiver finds it half written
+    /// (`sending.rs`). A file already of that name is replaced: one Journey
+    /// after another to a fixed name leaves the last one's file.
     fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
         let path = self.root.join(target);
 
@@ -266,7 +272,7 @@ impl Transport for FileTransport {
             fs::create_dir_all(parent).map_err(|e| classify("creating the send directory", &e))?;
         }
 
-        fs::write(&path, bytes).map_err(|e| classify("writing the sent file", &e))
+        sending::send(&path, bytes)
     }
 
     /// A file's own claim: the rename (ADR-0024, amendment 2026-09-26).
@@ -280,7 +286,7 @@ impl Transport for FileTransport {
 impl ResourceClaim for FileTransport {
     fn is_available(&self, artefact: &Artefact) -> Result<bool> {
         let path = Path::new(artefact.address());
-        Ok(stamp(path).is_some() && !is_claimed(path))
+        Ok(stamp(path).is_some() && is_arrival(path))
     }
 
     fn claim(&self, artefact: &Artefact) -> Result<Claimed> {
@@ -306,6 +312,12 @@ fn stamp(path: &Path) -> Option<Stamp> {
     metadata
         .is_file()
         .then(|| (metadata.len(), metadata.modified().ok()))
+}
+
+/// Whether the name of `path` can be an arrival: not a claim, a turn, nor
+/// a file a send is still writing.
+fn is_arrival(path: &Path) -> bool {
+    !is_claimed(path) && !is_sending(path)
 }
 
 fn lock(stamps: &Mutex<Stamps>) -> std::sync::MutexGuard<'_, Stamps> {
@@ -459,6 +471,23 @@ mod tests {
             taken.origin_uri
         );
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_file_still_being_sent_is_never_received() {
+        let dir = scratch("file-sending");
+        let transport = FileTransport::new(&dir);
+        let sending = dir.join("order.edi.xmip-sending.4242.7.1790000000123456789");
+        fs::write(&sending, b"ISA*").expect("a send half way");
+
+        assert!(settled(&transport).is_empty(), "not an arrival");
+        let artefact = Artefact::new(sending.to_string_lossy().into_owned());
+        assert!(!transport.is_available(&artefact).expect("asked"));
+        assert_eq!(fs::read(&sending).expect("left alone"), b"ISA*");
+
+        transport.send("order.edi", b"ISA*00*").expect("sending");
+        assert_eq!(the_one(&transport), b"ISA*00*");
         fs::remove_dir_all(&dir).ok();
     }
 
