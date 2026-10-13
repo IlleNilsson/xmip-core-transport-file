@@ -25,7 +25,12 @@ its directory without pause.
 
 ## The claim
 
-A file is taken once it is finished, and by one node (ADR-0024). A listing
+A file is taken once it is finished, and by one node (ADR-0024). The claim
+is the file family's, written once in the transport capability
+(`transport::claim`: the sequence, the names, the stability check, the
+return and the recovery) and shared with FTP, FTPS and SFTP since
+2026-10-13; what this crate writes is how a file system takes each step
+(`src/directory.rs`). A listing
 takes a file only where its length and modification time are what the
 listing before found — clause 5's stability check — so a file a producer is
 still writing is left until it stops growing. It is then claimed by renaming
@@ -82,7 +87,7 @@ free — right after the Location consumes a file (`Accepted` frees its
 dropped name), and at every receive, before the listing, for a name freed by
 anything else. Returned, it is an arrival again; one refused is remembered as
 refused first, as it would have been had it gone back at once. Meanwhile
-`FileTransport::held` lists each held file — where it lies and why — and the
+`FileTransport::held` lists each held file — its claimed name and why — and the
 verdict's telling that could not return it fails retryable with the same
 why. Until 2026-10-05 such a file stayed claimed, skipped by every receive,
 until its node started again.

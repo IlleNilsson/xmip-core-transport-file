@@ -28,7 +28,8 @@ impl FileTransport {
     /// exchange so the directory is made once and the round stays as fast as
     /// the file transport is.
     fn thread_directory(&self) -> PathBuf {
-        self.root
+        self.directory
+            .root
             .join(format!("t{:?}", std::thread::current().id()))
     }
 }
