@@ -6,16 +6,18 @@
 //! therefore *inferred* from the Receive Location rather than passed by a caller
 //! — ADR-0019 clause 8.
 //!
-//! **A file is taken once it is finished, and by one node.** A listing takes
-//! a file only where its length and modification time are what the listing
-//! before found (ADR-0024 clause 5, the stability check), so a file a
-//! producer is still writing is left until it stops growing. It is then
-//! claimed by renaming it to a name recording the node and the time
-//! (`claim.rs`; ADR-0024, amendment 2026-09-26): whichever node's rename
-//! succeeds has it, and every other finds it gone. The node is the one the
-//! runtime names as it builds the transport ([`Configured::on_node`]), and
-//! a node that starts returns to the drop directory whatever its name still
-//! holds there, since nothing holds it now.
+//! **A file is taken once it is finished, and by one node.** The claim is
+//! the transport capability's, written once for the file family
+//! (`transport::claim`; ADR-0024, amendments 2026-09-26 and 2026-10-13): a
+//! listing takes a file only where its length and modification time are
+//! what the listing before found — the stability check — so a file a
+//! producer is still writing is left until it stops growing; it is then
+//! claimed by taking its turn and renaming it to a name recording the node
+//! and the time, and whichever node's rename succeeds has it. The node is
+//! the one the runtime names as it builds the transport
+//! ([`Configured::on_node`]), and a node that starts returns to the drop
+//! directory whatever its name still holds there, since nothing holds it
+//! now. How a file system takes each step is `directory.rs`.
 //!
 //! **A file is consumed only on its verdict.** `receive` hands each claimed
 //! file back as a reader over it, opened as the runtime first reads it; the
@@ -33,96 +35,66 @@
 //! one dropped under its name since; such a file waits, held under its
 //! claimed name with why ([`FileTransport::held`]), and goes back as soon
 //! as the name is free: once this Location consumes the newer file, or at
-//! the next receive (`waiting.rs`).
+//! the next receive.
 
-mod claim;
+mod directory;
 mod loopback;
 mod sending;
-mod waiting;
 
-use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io;
+use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
-use std::time::SystemTime;
 
-use transport::Acknowledgement;
 use transport::Arrived;
 use transport::Configured;
 use transport::Directions;
 use transport::NodeLocation;
 use transport::Transport;
-use transport::Verdict;
 use transport::body::opened;
-use transport::claim::{Artefact, Claimed, ResourceClaim};
-use transport::error::{Result, TransportError, classify};
+use transport::claim::{Claimant, Claiming, Held, ResourceClaim, Site, Sited};
+use transport::error::{Result, classify};
 use xcore::settings::{Read, Settings};
 
-use crate::claim::{Claimant, is_claimed};
-use crate::sending::is_sending;
-use crate::waiting::Waiting;
-
-pub use crate::waiting::HeldFile;
-
-/// A file as a listing found it: its length and its modification time.
-/// The same stamp at two listings is a finished file; the same stamp as
-/// when it was refused is the refused file, still lying there.
-type Stamp = (u64, Option<SystemTime>);
-
-/// Files by path, each with its stamp.
-type Stamps = HashMap<PathBuf, Stamp>;
-
-/// The refused files a Location leaves where they lie, each as it was
-/// refused: the capability's one memory of them (`transport::refused`).
-type Refused = transport::Refused<PathBuf, Stamp>;
+pub use crate::directory::{Directory, Stamp};
 
 pub struct FileTransport {
-    root: PathBuf,
-    claimant: Claimant,
-    /// What the last listing found, not yet taken: the stability check's
-    /// other half.
-    listed: Mutex<Stamps>,
-    refused: Refused,
-    waiting: Waiting,
+    directory: Directory,
+    /// The claims made here, the stability check's memory, the refused
+    /// files and those waiting to go back.
+    claiming: Claiming<Stamp>,
 }
 
 impl FileTransport {
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
-            root: root.into(),
-            claimant: Claimant::process(),
-            listed: Mutex::default(),
-            refused: Refused::default(),
-            waiting: Waiting::default(),
+            directory: Directory::at(root),
+            claiming: Claiming::new(Claimant::process()),
         }
     }
 
     /// The claimed files this Location could not return yet, since a file
-    /// was dropped under the same name meanwhile: where each lies, and
-    /// why. Each goes back as soon as its name is free.
+    /// was dropped under the same name meanwhile: each by its claimed name,
+    /// and why. Each goes back as soon as its name is free.
     #[must_use]
-    pub fn held(&self) -> Vec<HeldFile> {
-        self.waiting.held()
+    pub fn held(&self) -> Vec<Held> {
+        self.claiming.held()
     }
 
     /// One claimed file: read as the runtime asks, deleted on `Accepted`,
     /// returned and remembered as refused on `Refused`, returned on
     /// `Failed` or when let go without a verdict.
-    fn arrived(&self, dropped: &Path, claimed: PathBuf) -> Arrived {
+    fn arrived(&self, dropped: &str, claimed: String) -> Arrived {
         // `file://` and the dropped path as `net::uri` writes it:
         // `file:///C:/in/a.edi`.
-        let origin = format!("file://{}", net::uri::path_of(dropped));
-        let read = claimed.clone();
-        let owned = owner(&claimed);
-        let hold = Hold {
-            claimed,
-            refused: self.refused.clone(),
-            waiting: self.waiting.clone(),
-            told: false,
-        };
-        let acknowledgement = Acknowledgement::deferred(move |verdict| hold.tell(verdict));
+        let origin = format!(
+            "file://{}",
+            net::uri::path_of(&self.directory.path(dropped))
+        );
+        let read = self.directory.path(&claimed);
+        let owned = owner(&read);
+        let acknowledgement = self
+            .claiming
+            .acknowledgement(self.directory.clone(), claimed, true);
         // Opened on its first read, so a drop directory of many files holds
         // one handle per file being read, not one per file listed.
         let body =
@@ -141,7 +113,7 @@ impl FileTransport {
 #[cfg(unix)]
 fn owner(path: &Path) -> Vec<(String, String)> {
     use std::os::unix::fs::MetadataExt;
-    fs::metadata(path).map_or_else(
+    std::fs::metadata(path).map_or_else(
         |_| Vec::new(),
         |metadata| {
             transport::arrival_identity::file_owner(metadata.uid(), metadata.gid(), metadata.mode())
@@ -153,45 +125,6 @@ fn owner(path: &Path) -> Vec<(String, String)> {
 #[cfg(not(unix))]
 fn owner(_: &Path) -> Vec<(String, String)> {
     Vec::new()
-}
-
-/// A claimed file held through its receive cycle: told its verdict once,
-/// and returned to the drop directory if it never is.
-struct Hold {
-    claimed: PathBuf,
-    refused: Refused,
-    waiting: Waiting,
-    told: bool,
-}
-
-impl Hold {
-    fn tell(mut self, verdict: Verdict) -> Result<()> {
-        self.told = true;
-        match verdict {
-            Verdict::Accepted => {
-                match fs::remove_file(&self.claimed) {
-                    // Gone already: consumed, which is what was asked.
-                    Err(ref e) if e.kind() == io::ErrorKind::NotFound => {}
-                    done => done.map_err(|e| classify("deleting a received file", &e))?,
-                }
-                // Its dropped name is free now: a file waiting for it goes back.
-                self.waiting.settle(&self.refused);
-                Ok(())
-            }
-            Verdict::Refused(_) => self.waiting.give_back(&self.claimed, Some(&self.refused)),
-            Verdict::Failed => self.waiting.give_back(&self.claimed, None),
-        }
-    }
-}
-
-impl Drop for Hold {
-    /// Let go without a verdict: nothing was consumed, so the file goes
-    /// back where it was dropped.
-    fn drop(&mut self) {
-        if !self.told {
-            let _ = self.waiting.give_back(&self.claimed, None);
-        }
-    }
 }
 
 impl Transport for FileTransport {
@@ -212,57 +145,12 @@ impl Transport for FileTransport {
     }
 
     fn receive(&self) -> Result<Vec<Arrived>> {
-        // A held file whose name was freed since goes back first, and is
-        // listed with the rest.
-        self.waiting.settle(&self.refused);
-        let entries = match fs::read_dir(&self.root) {
-            Ok(entries) => entries,
-            // A drop directory that does not exist yet is not a failure. It is
-            // a Receive Location nobody has sent to.
-            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(classify("reading the drop directory", &e)),
-        };
-
-        let mut found = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|e| classify("listing the drop directory", &e))?;
-            let path = entry.path();
-            if let Some(stamp) = stamp(&path)
-                && is_arrival(&path)
-            {
-                found.push((path, stamp));
-            }
-        }
-        // A file still as it was refused is left out; a file gone or
-        // written again is forgotten, as what this listing did not take is,
-        // so neither memory is ever more than the directory holds.
-        let found = self
-            .refused
-            .sift(found, |(path, _)| path, |(_, stamp)| Some(*stamp));
-        let mut arrived = Vec::new();
-        let mut seen = Stamps::new();
-        let mut listed = lock(&self.listed);
-
-        for (path, stamp) in found {
-            // Unchanged since the last listing, and still so once its turn
-            // is held: finished, and the file that was found.
-            let finished = listed.get(&path) == Some(&stamp);
-            let unchanged = || self::stamp(&path) == Some(stamp);
-            match finished
-                .then(|| self.claimant.claim(&path, unchanged))
-                .flatten()
-            {
-                Some(claimed) => {
-                    arrived.push(self.arrived(&path, claimed));
-                }
-                None => {
-                    seen.insert(path, stamp);
-                }
-            }
-        }
-
-        *listed = seen;
-        Ok(arrived)
+        Ok(self
+            .claiming
+            .take(&self.directory)?
+            .into_iter()
+            .map(|taken| self.arrived(&taken.dropped, taken.claimed))
+            .collect())
     }
 
     /// `bytes` as the file `target` in the directory, written whole beside
@@ -270,62 +158,35 @@ impl Transport for FileTransport {
     /// (`sending.rs`). A file already of that name is replaced: one Journey
     /// after another to a fixed name leaves the last one's file.
     fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
-        let path = self.root.join(target);
+        let path = self.directory.path(target);
 
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| classify("creating the send directory", &e))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| classify("creating the send directory", &e))?;
         }
 
         sending::send(&path, bytes)
     }
 
-    /// A file's own claim: the rename (ADR-0024, amendment 2026-09-26).
+    /// A file's own claim: the turn and the rename (ADR-0024, amendments
+    /// 2026-09-26 and 2026-10-13).
     fn claims(&self) -> Option<&dyn ResourceClaim> {
         Some(self)
     }
 }
 
 /// The claim [`FileTransport::receive`] takes, for a caller holding one
-/// file by its path: the artefact's address is the path.
-impl ResourceClaim for FileTransport {
-    fn is_available(&self, artefact: &Artefact) -> Result<bool> {
-        let path = Path::new(artefact.address());
-        Ok(stamp(path).is_some() && is_arrival(path))
+/// file by its address, a path or its name in the directory.
+impl Sited for FileTransport {
+    type Stamp = Stamp;
+
+    fn claiming(&self) -> &Claiming<Stamp> {
+        &self.claiming
     }
 
-    fn claim(&self, artefact: &Artefact) -> Result<Claimed> {
-        let claimed = self
-            .claimant
-            .claim(Path::new(artefact.address()), || true)
-            .ok_or_else(|| TransportError::retryable(format!("{artefact} is held, or gone")))?;
-        Ok(Claimed::new(
-            artefact.clone(),
-            claimed.to_string_lossy().into_owned(),
-        ))
+    fn with_site<T>(&self, act: &mut dyn FnMut(Site<'_, Stamp>) -> Result<T>) -> Result<T> {
+        act(&self.directory)
     }
-
-    fn release(&self, claimed: Claimed) -> Result<()> {
-        self.waiting.give_back(Path::new(&claimed.token), None)
-    }
-}
-
-/// The stamp of the file at `path`; nothing where it is not a file, or
-/// is gone.
-fn stamp(path: &Path) -> Option<Stamp> {
-    let metadata = fs::metadata(path).ok()?;
-    metadata
-        .is_file()
-        .then(|| (metadata.len(), metadata.modified().ok()))
-}
-
-/// Whether the name of `path` can be an arrival: not a claim, a turn, nor
-/// a file a send is still writing.
-fn is_arrival(path: &Path) -> bool {
-    !is_claimed(path) && !is_sending(path)
-}
-
-fn lock(stamps: &Mutex<Stamps>) -> std::sync::MutexGuard<'_, Stamps> {
-    stamps.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Configured for FileTransport {
@@ -343,11 +204,8 @@ impl Configured for FileTransport {
     /// 2026-09-26). One whose dropped name a newer file has taken is held
     /// until the name is free.
     fn on_node(mut self, node: &NodeLocation) -> Result<Self> {
-        self.claimant = Claimant::of(node);
-        for claimed in self.claimant.recover(&self.root)? {
-            // Held where it cannot go back now, and visible as such.
-            let _ = self.waiting.give_back(&claimed, None);
-        }
+        self.claiming = Claiming::new(Claimant::of(node));
+        self.claiming.recover(&self.directory)?;
         Ok(self)
     }
 }
@@ -357,9 +215,11 @@ mod tests {
     use super::*;
     use context::property::FILE_MODE;
     use std::collections::BTreeSet;
+    use std::fs;
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
     use transport::Refusal;
+    use transport::claim::Artefact;
     use transport::loopback::Loopback;
     use xcore::settings::Applies;
 
@@ -420,7 +280,7 @@ mod tests {
         use xcore::settings::Given;
         assert!(FileTransport::SETTINGS.settings.is_empty());
         let transport = FileTransport::open("in", Applies::Receive, &[]).expect("configured");
-        assert_eq!(transport.root, PathBuf::from("in"));
+        assert_eq!(transport.directory.root, PathBuf::from("in"));
         let unknown = [("colour".to_string(), Given::Text("lime".to_string()))];
         let refused = FileTransport::open("in", Applies::Receive, &unknown)
             .err()
@@ -693,15 +553,7 @@ mod tests {
         let held = transport.held();
         assert_eq!(held.len(), 1, "visible as held: {held:?}");
         assert!(held[0].why.contains("dropped since"), "{}", held[0].why);
-        assert!(
-            names(&dir).contains(
-                held[0]
-                    .claimed
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .expect("a name")
-            )
-        );
+        assert!(names(&dir).contains(&held[0].claimed));
 
         assert_eq!(the_one(&transport), b"new", "the newer file is received");
         assert_eq!(
