@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn file_declares_it_takes_nothing_beyond_its_directory() {
         use xcore::settings::Given;
-        assert!(FileTransport::SETTINGS.settings.is_empty());
+        assert_eq!(FileTransport::SETTINGS.settings, []);
         let transport = FileTransport::open("in", Applies::Receive, &[]).expect("configured");
         assert_eq!(transport.directory.root, PathBuf::from("in"));
         let unknown = [("colour".to_string(), Given::Text("lime".to_string()))];
@@ -561,7 +561,7 @@ mod tests {
             BTreeSet::from(["order.edi".to_string()]),
             "its name freed, the older goes back at once, no restart"
         );
-        assert!(transport.held().is_empty());
+        assert_eq!(transport.held(), [] as [Held; 0]);
         assert_eq!(the_one(&transport), b"old", "and is received again");
         fs::remove_dir_all(&dir).ok();
     }
@@ -582,7 +582,7 @@ mod tests {
         // Freed by somebody else: the next receive returns it.
         fs::remove_file(dir.join("order.edi")).expect("the newer file taken away");
         assert!(transport.receive().expect("receiving").is_empty());
-        assert!(transport.held().is_empty());
+        assert_eq!(transport.held(), [] as [Held; 0]);
         assert_eq!(fs::read(dir.join("order.edi")).expect("returned"), b"old");
         for _ in 0..3 {
             assert!(
