@@ -267,7 +267,7 @@ mod tests {
         directory
             .drop_turn("order.edi.xmip-claim", "one")
             .expect("dropped");
-        assert!(directory.turns().expect("listed").is_empty());
+        assert_eq!(directory.turns().expect("listed"), [] as [String; 0]);
         let _ = fs::remove_dir_all(&directory.root);
     }
 }
