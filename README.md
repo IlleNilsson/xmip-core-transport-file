@@ -47,6 +47,13 @@ only where it does not exist and removed once the rename is done; a node
 that finds the turn taken leaves the file to its next listing. A claimed
 name, and a turn, are never an arrival.
 
+A receive claims no more files than the runtime has room for
+(`Transport::receive_up_to`): the rest of a listing stay as they were
+dropped, remembered as found, and the next listing takes them as it takes
+any finished file, so a directory of thousands is claimed as the Location's
+pool and the node have room, never all at once. Until 2026-10-19 a
+listing claimed every finished file it found.
+
 The node is the one the runtime names as it builds the transport
 (`transport::Configured::on_node`, the owner's *Option A*, 2026-10-03), and
 a node that starts returns to the drop directory every claim its name still
@@ -107,10 +114,11 @@ and could replace a file dropped in between.
 
 ## Send
 
-A send writes the file whole beside its target, in the same directory, under
-a name no listing takes, then syncs it and renames it over the target in one
-step, so a receiver finds the target as it was before or whole, never half
-written:
+A send writes the file beside its target as the Message is read from the
+Ledger, a piece at a time and never whole in memory (`Sending::Streamed`,
+2026-10-19), in the same directory, under a name no listing takes, then
+syncs it and renames it over the target in one step, so a receiver finds
+the target as it was before or whole, never half written:
 
 ```text
 order.edi.xmip-sending.<process id>.<count in the process>.<nanoseconds since 1970>
@@ -118,7 +126,8 @@ order.edi.xmip-sending.<process id>.<count in the process>.<nanoseconds since 19
 
 A file already of the target's name is replaced: one Journey after another to
 a fixed name leaves the last one's file. Where the write, the sync or the
-rename fails, the written file is removed and the target is left as it was.
+rename fails, or the Message cannot be read, the written file is removed and
+the target is left as it was.
 Until 2026-10-12 a send wrote the target in place, and a receiver could take
 it half written.
 
