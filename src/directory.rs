@@ -20,8 +20,6 @@ use std::time::SystemTime;
 use transport::claim::{ClaimSite, Listed, Restore, is_turn};
 use transport::error::{Result, classify};
 
-use crate::sending::is_sending;
-
 /// A file as a listing found it: its length and its modification time.
 /// The same stamp at two listings is a finished file; the same stamp as
 /// when it was refused is the refused file, still lying there.
@@ -44,8 +42,8 @@ impl Directory {
     }
 
     /// Every name in the directory, or none where it does not exist yet:
-    /// a Receive Location nobody has sent to.
-    fn names(&self) -> Result<Vec<String>> {
+    /// a Receive Location nobody has sent to, a Send Location never sent.
+    pub(crate) fn names(&self) -> Result<Vec<String>> {
         let entries = match fs::read_dir(&self.root) {
             Ok(entries) => entries,
             Err(ref e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -74,15 +72,14 @@ pub(crate) fn stamp(path: &Path) -> Option<Stamp> {
 impl ClaimSite for Directory {
     type Stamp = Stamp;
 
-    /// Every file, but one a send is still writing.
+    /// Every file; the claim leaves out what is no arrival.
     fn listed(&self) -> Result<Vec<Listed<Stamp>>> {
         Ok(self
             .names()?
             .into_iter()
             .filter_map(|name| {
-                let path = self.path(&name);
-                let found = stamp(&path)?;
-                (!is_sending(&path)).then_some((name, Some(found)))
+                let found = stamp(&self.path(&name))?;
+                Some((name, Some(found)))
             })
             .collect())
     }
@@ -146,7 +143,7 @@ impl ClaimSite for Directory {
         match fs::remove_file(self.path(name)) {
             // Gone already: consumed, which is what was asked.
             Err(ref e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            done => done.map_err(|e| classify("deleting a received file", &e)),
+            done => done.map_err(|e| classify("deleting a file", &e)),
         }
     }
 }

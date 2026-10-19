@@ -17,7 +17,9 @@
 //! the one the runtime names as it builds the transport
 //! ([`Configured::on_node`]), and a node that starts returns to the drop
 //! directory whatever its name still holds there, since nothing holds it
-//! now. How a file system takes each step is `directory.rs`.
+//! now, and removes what its sends left half sent (`sending.rs`; ADR-0024,
+//! amendment 2026-10-19). How a file system takes each step is
+//! `directory.rs`.
 //!
 //! **A file is consumed only on its verdict.** `receive` hands each claimed
 //! file back as a reader over it, opened as the runtime first reads it; the
@@ -52,15 +54,19 @@ use transport::Transport;
 use transport::body::opened;
 use transport::claim::{Claimant, Claiming, Held, ResourceClaim, Site, Sited};
 use transport::error::{Result, classify};
-use xcore::settings::{Read, Settings};
+use xcore::settings::{Applies, Read, Settings};
 
 pub use crate::directory::{Directory, Stamp};
 
 pub struct FileTransport {
     directory: Directory,
     /// The claims made here, the stability check's memory, the refused
-    /// files and those waiting to go back.
+    /// files and those waiting to go back; its claimant names the files
+    /// its sends write beside their targets.
     claiming: Claiming<Stamp>,
+    /// Whether it was built for a Send Location, whose address names the
+    /// file it writes, not a drop directory.
+    sends: bool,
 }
 
 impl FileTransport {
@@ -69,7 +75,18 @@ impl FileTransport {
         Self {
             directory: Directory::at(root),
             claiming: Claiming::new(Claimant::process()),
+            sends: false,
         }
+    }
+
+    /// The directory a send to this Location's address writes beside its
+    /// target in: the runtime sends a Send Location's Messages to its
+    /// address (`xmip-core-runtime`'s `departure`), so the file a send
+    /// writes is the address, read as [`FileTransport::send_from`] reads a
+    /// target.
+    fn beside_the_target(&self) -> Option<Directory> {
+        let target = self.directory.root.join(&self.directory.root);
+        target.parent().map(Directory::at)
     }
 
     /// The claimed files this Location could not return yet, since a file
@@ -170,7 +187,7 @@ impl Transport for FileTransport {
                 .map_err(|e| classify("creating the send directory", &e))?;
         }
 
-        sending::send(&path, &outgoing)
+        sending::send(&path, self.claiming.claimant(), &outgoing)
     }
 
     /// A file's own claim: the turn and the rename (ADR-0024, amendments
@@ -203,14 +220,33 @@ impl Configured for FileTransport {
         Ok(Self::new(address))
     }
 
-    /// Claims made in `node`'s name from here on, and every claim that name
-    /// still holds in the directory returned to it: the node is starting,
-    /// so whatever it held before, nothing holds now (ADR-0024, amendment
-    /// 2026-09-26). One whose dropped name a newer file has taken is held
-    /// until the name is free.
+    /// Whether the Location sends: its address is then the file it writes.
+    fn sided(self, side: Applies) -> Self {
+        Self {
+            sends: side == Applies::Send,
+            ..self
+        }
+    }
+
+    /// Claims made, and sent files named, in `node`'s name from here on;
+    /// what that name left before, recovered: the node is starting, so
+    /// whatever it held or was writing before, nothing holds now (ADR-0024,
+    /// amendments 2026-09-26 and 2026-10-19). A Receive Location returns
+    /// every claim the name still holds in its drop directory — one whose
+    /// dropped name a newer file has taken is held until the name is free
+    /// — and removes its turns and the sent files its sends left
+    /// unfinished there. A Send Location claims nothing, and removes the
+    /// sent files its node's sends left unfinished beside its target.
+    /// Another node's file is never touched, nor one a send of this
+    /// process is still writing.
     fn on_node(mut self, node: &NodeLocation) -> Result<Self> {
         self.claiming = Claiming::new(Claimant::of(node));
-        self.claiming.recover(&self.directory)?;
+        if !self.sends {
+            self.claiming.recover(&self.directory)?;
+        } else if let Some(beside) = self.beside_the_target() {
+            let claimant = self.claiming.claimant();
+            claimant.remove_unfinished(&beside, beside.names()?)?;
+        }
         Ok(self)
     }
 }
@@ -224,7 +260,7 @@ mod tests {
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
     use transport::Refusal;
-    use transport::claim::Artefact;
+    use transport::claim::{Artefact, Claimant};
     use transport::loopback::Loopback;
     use xcore::settings::Applies;
 
@@ -347,7 +383,8 @@ mod tests {
     fn a_file_still_being_sent_is_never_received() {
         let dir = scratch("file-sending");
         let transport = FileTransport::new(&dir);
-        let sending = dir.join("order.edi.xmip-sending.4242.7.1790000000123456789");
+        let writing = Claimant::of(&node(1)).sending("order.edi");
+        let sending = dir.join(writing.name());
         fs::write(&sending, b"ISA*").expect("a send half way");
 
         assert!(settled(&transport).is_empty(), "not an arrival");
@@ -697,6 +734,59 @@ mod tests {
             b"ISA*00*"
         );
         assert_eq!(settled(&restarted).len(), 1, "and received again");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A file `place`'s node left half sent to `target` in `dir`: a send
+    /// its process did not finish.
+    fn left_half_sent(dir: &Path, place: usize, target: &str) -> String {
+        let name = Claimant::of(&node(place))
+            .sending(target)
+            .name()
+            .to_string();
+        fs::write(dir.join(&name), b"ISA*").expect("a send half way");
+        name
+    }
+
+    #[test]
+    fn a_starting_node_removes_the_sends_it_left_in_its_drop_directory_and_no_others() {
+        let dir = scratch("file-left-receive");
+        let mine = left_half_sent(&dir, 0, "order.edi");
+        let theirs = left_half_sent(&dir, 1, "order.edi");
+        FileTransport::new(&dir)
+            .send("dropped.edi", b"ISA*00*")
+            .expect("sending");
+
+        let restarted = on(&dir, 0);
+
+        let after = names(&dir);
+        assert!(!after.contains(&mine), "its own removed: {after:?}");
+        assert!(after.contains(&theirs), "another node's kept: {after:?}");
+        let mut arrived = settled(&restarted);
+        assert_eq!(arrived.len(), 1, "a half sent file is never an arrival");
+        assert_eq!(arrived.remove(0).taken().expect("taken").bytes, b"ISA*00*");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_starting_send_location_removes_what_its_node_left_beside_the_target() {
+        let dir = scratch("file-left-send");
+        let target = dir.join("billing.edi");
+        fs::write(&target, b"sent before").expect("a file sent before");
+        let mine = left_half_sent(&dir, 0, "billing.edi");
+        let theirs = left_half_sent(&dir, 1, "billing.edi");
+        let address = target.to_str().expect("a UTF-8 path");
+
+        let sending = FileTransport::open(address, Applies::Send, &[])
+            .and_then(|transport| transport.on_node(&node(0)))
+            .expect("a node with a file sent before starts");
+
+        let after = names(&dir);
+        assert!(!after.contains(&mine), "its own removed: {after:?}");
+        assert!(after.contains(&theirs), "another node's kept: {after:?}");
+        sending.send(address, b"ISA*00*").expect("sending");
+        assert_eq!(fs::read(&target).expect("sent"), b"ISA*00*");
+        assert_eq!(names(&dir).len(), 2, "{:?}", names(&dir));
         fs::remove_dir_all(&dir).ok();
     }
 
