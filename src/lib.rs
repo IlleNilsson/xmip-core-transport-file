@@ -144,20 +144,25 @@ impl Transport for FileTransport {
         transport::Waiting::Polled("a receive lists the drop directory and returns")
     }
 
-    fn receive(&self) -> Result<Vec<Arrived>> {
+    fn receive_up_to(&self, most: usize) -> Result<Vec<Arrived>> {
         Ok(self
             .claiming
-            .take(&self.directory)?
+            .take(&self.directory, most)?
             .into_iter()
             .map(|taken| self.arrived(&taken.dropped, taken.claimed))
             .collect())
     }
 
-    /// `bytes` as the file `target` in the directory, written whole beside
-    /// it and renamed into place, so no receiver finds it half written
+    fn sending(&self) -> transport::Sending {
+        transport::Sending::Streamed("the file is written as the body is read")
+    }
+
+    /// The body as the file `target` in the directory, written beside it
+    /// as it is read — a piece at a time, never whole in memory — and renamed
+    /// into place once whole, so no receiver finds it half written
     /// (`sending.rs`). A file already of that name is replaced: one Journey
     /// after another to a fixed name leaves the last one's file.
-    fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
+    fn send_from(&self, target: &str, outgoing: transport::Outgoing<'_>) -> Result<()> {
         let path = self.directory.path(target);
 
         if let Some(parent) = path.parent() {
@@ -165,7 +170,7 @@ impl Transport for FileTransport {
                 .map_err(|e| classify("creating the send directory", &e))?;
         }
 
-        sending::send(&path, bytes)
+        sending::send(&path, &outgoing)
     }
 
     /// A file's own claim: the turn and the rename (ADR-0024, amendments
@@ -441,6 +446,42 @@ mod tests {
         assert_eq!(all.len(), FILES, "every file taken, none twice");
         assert_eq!(once.len(), FILES);
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_receive_claims_no_more_than_it_was_given_room_for_and_leaves_the_rest() {
+        let dir = scratch("file-room");
+        let sender = FileTransport::new(&dir);
+        for file in 0..10 {
+            sender
+                .send(&format!("order-{file}.edi"), b"ISA")
+                .expect("sending");
+        }
+        let receiver = on(&dir, 0);
+        assert!(
+            receiver.receive_up_to(3).expect("found").is_empty(),
+            "found first"
+        );
+        let mut took = 0;
+        while took < 10 {
+            let arrived = receiver.receive_up_to(3).expect("receiving");
+            assert!(
+                (1..=3).contains(&arrived.len()),
+                "{} at once",
+                arrived.len()
+            );
+            let claimed = names(&dir)
+                .iter()
+                .filter(|name| transport::claim::is_claimed(name))
+                .count();
+            assert_eq!(claimed, arrived.len(), "the rest left as dropped");
+            took += arrived.len();
+            for one in arrived {
+                one.taken().expect("accepted");
+            }
+        }
+        assert!(names(&dir).is_empty(), "every file taken in its turn");
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
