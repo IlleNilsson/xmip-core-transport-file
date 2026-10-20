@@ -115,6 +115,26 @@ and could replace a file dropped in between.
 
 ## Send
 
+A Send Location's address names a directory, and each Message is written
+there under the name it was received under (the owner, 2026-10-19; ADR-0024,
+amendment 2026-10-20). A file Receive Location writes the name a file was
+dropped under on its arrival as `file.name` (`context::property::FILE_NAME`),
+the runtime keeps it in the Message Context, and a send reads it from the
+context the runtime hands it (`transport::Outgoing::context`). A Message
+carrying no `file.name` — one received over another transport — or one
+naming a path rather than a file (`..`, `sub/order.edi`) is refused in
+words, permanently, and nothing is written. A test or a tool that sends
+bytes it holds names the file itself, as the send's target. Until
+2026-10-20 the address named one file, and a relative address was written
+inside itself (`out/out`).
+
+```toml
+[[applications.send_ports]]
+name = "Out"
+transport = "xmip-core-transport-file"
+address = "out"                  # out/order-1001.edi, for order-1001.edi dropped in
+```
+
 A send writes the file beside its target as the Message is read from the
 Ledger, a piece at a time and never whole in memory (`Sending::Streamed`,
 2026-10-19), in the same directory, under a name no listing takes, then
@@ -127,8 +147,8 @@ the node that writes it, as a claimed name does (`transport::claim`'s
 order.edi.xmip-sending.<the node's location, percent-encoded>.<count in the process>.<nanoseconds since 1970>
 ```
 
-A file already of the target's name is replaced: one Journey after another to
-a fixed name leaves the last one's file. Where the write, the sync or the
+A file already of the target's name is replaced: two Messages received under
+one name leave the last one's file. Where the write, the sync or the
 rename fails, or the Message cannot be read, the written file is removed and
 the target is left as it was.
 Until 2026-10-12 a send wrote the target in place, and a receiver could take
@@ -136,8 +156,8 @@ it half written.
 
 A process that dies between the write and the rename leaves the written
 file. Its node removes it as it starts again (the owner, 2026-10-19): a Send
-Location, whose address names the file it writes, removes what its node's
-sends left beside that file; a Receive Location removes what they left in
+Location removes what its node's sends left in the directory its address
+names; a Receive Location removes what they left in
 its drop directory while it returns its claims. Another node's file is never
 removed, nor one a send of the same process is still writing. The address
 means one thing to a receive and another to a send, so the transport learns
