@@ -1,6 +1,7 @@
 # xmip-core-transport-file
 
-File transport: Streams that arrive as files in a directory, polled. A technology of
+File transport: Streams that arrive as files in a directory, told by the file
+system's change notification. A technology of
 [xmip-core-transport](https://github.com/IlleNilsson/xmip-core-transport), which
 owns the direction-neutral `Transport` trait this crate implements (ADR-0010).
 
@@ -9,19 +10,21 @@ Lifted out of the capability crate on 2026-09-07, where it had lived as
 the trait, the error vocabulary and the shared wire helpers; nothing in it names
 a protocol.
 
-## Polled
+## Told
 
 A receive lists the drop directory and returns at once, whatever it found
-(`Transport::waiting` is `Polled`). After a receive that found nothing the
-runtime waits the node's poll interval — `[tuning] receive_poll`, a wait a
-stop ends at once — before it lists again, so an idle Location costs one
-listing per interval and never a spin (runtime-model section 5, *How a
-receive runs*). A file is taken by the listing after the one that first
-found it unchanged (below), so it waits about one interval. The file system's
-change notification — `ReadDirectoryChangesW`, inotify, `FSEvents` — would
-let the receive wait for a change instead; it is not used yet. Until
-2026-10-12 the runtime listed again at once, and an idle Location listed
-its directory without pause.
+(`Transport::waiting` is `Polled`), and the drop directory tells of a change
+(`Transport::notice` names it): the runtime watches it with the operating
+system's change notification — a change notification on Windows, inotify on
+Linux and Android, kqueue on macOS and the BSDs (`runtime::directory_watch`)
+— and after a receive that found nothing rests until a file lands, or for
+its recovery sweep, `[tuning] receive_sweep`, where none does, so an idle
+Location costs one listing a sweep and a file is listed as it lands
+(ADR-0024, amendment 2026-10-20). A drop directory not there yet is listed
+at the node's poll interval, `[tuning] receive_poll`, until it is, then
+watched. Until 2026-10-20 the Location listed its directory at its poll
+interval, and a file waited about one interval, a second by default, to be
+claimed; until 2026-10-12 the runtime listed again at once.
 
 ## The claim
 
@@ -30,7 +33,12 @@ is the file family's, written once in the transport capability
 (`transport::claim`: the sequence, the names, the stability check, the
 return and the recovery) and shared with FTP, FTPS and SFTP since
 2026-10-13; what this crate writes is how a file system takes each step
-(`src/directory.rs`). A listing
+(`src/directory.rs`). On Windows a listing takes a file once no handle
+writes it — an open sharing reading and deleting and not writing, which the
+system refuses while one does (`ClaimSite::finished`) — so a file renamed in
+whole, or closed, is taken by the listing its change wakes, and one a
+producer still writes, paused or not, is never taken (ADR-0024, amendment
+2026-10-20). Where the system does not say, on Linux and macOS, a listing
 takes a file only where its length and modification time are what the
 listing before found — clause 5's stability check — so a file a producer is
 still writing is left until it stops growing. It is then claimed by renaming
@@ -148,9 +156,13 @@ order.edi.xmip-sending.<the node's location, percent-encoded>.<count in the proc
 ```
 
 A file already of the target's name is replaced: two Messages received under
-one name leave the last one's file. Where the write, the sync or the
-rename fails, or the Message cannot be read, the written file is removed and
-the target is left as it was.
+one name leave the last one's file. The rename waits until the Message is
+durable in the Ledger (`Outgoing::kept`, `Transport::holds_back`), so the
+write and its sync overlap the Ledger's own sync and no receiver finds a
+file the Ledger could lose (ADR-0018, amendment 2026-10-20). The directory
+is made where the first file written there finds it missing. Where the
+write, the sync, the wait or the rename fails, or the Message cannot be
+read, the written file is removed and the target is left as it was.
 Until 2026-10-12 a send wrote the target in place, and a receiver could take
 it half written.
 

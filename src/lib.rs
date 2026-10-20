@@ -195,6 +195,12 @@ impl Transport for FileTransport {
         transport::Waiting::Polled("a receive lists the drop directory and returns")
     }
 
+    /// The drop directory, whose file system's change notification tells
+    /// of a file dropped in it; nothing for a Send Location's directory.
+    fn notice(&self) -> Option<transport::Notice> {
+        (!self.sends).then(|| transport::Notice::Directory(self.directory.root.clone()))
+    }
+
     fn receive_up_to(&self, most: usize) -> Result<Vec<Arrived>> {
         Ok(self
             .claiming
@@ -217,9 +223,11 @@ impl Transport for FileTransport {
     /// file (ADR-0024, amendment 2026-10-20).
     fn send_from(&self, target: &str, outgoing: transport::Outgoing<'_>) -> Result<()> {
         let path = self.sent_to(target, &outgoing)?;
-        std::fs::create_dir_all(&self.directory.root)
-            .map_err(|e| classify("creating the send directory", &e))?;
         sending::send(&path, self.claiming.claimant(), &outgoing)
+    }
+
+    fn holds_back(&self) -> Option<&'static str> {
+        Some("the file is written beside its target and renamed into place once kept")
     }
 
     /// A file's own claim: the turn and the rename (ADR-0024, amendments
@@ -326,13 +334,15 @@ mod tests {
             .expect("built on its node")
     }
 
-    /// What two listings take: the first finds, the second takes what the
-    /// first found unchanged.
+    /// What a finished file's listings take: the first, where the system
+    /// says no writer holds it (Windows); else the second, which finds it
+    /// unchanged since the first.
     fn settled(transport: &FileTransport) -> Vec<Arrived> {
-        assert!(
-            transport.receive().expect("listing").is_empty(),
-            "nothing is taken at its first listing"
-        );
+        let first = transport.receive().expect("listing");
+        if cfg!(windows) {
+            return first;
+        }
+        assert!(first.is_empty(), "nothing is taken at its first listing");
         transport.receive().expect("listing again")
     }
 
@@ -525,10 +535,15 @@ mod tests {
                 .expect("sending");
         }
         let receiver = on(&dir, 0);
-        assert!(
-            receiver.receive_up_to(3).expect("found").is_empty(),
-            "found first"
-        );
+        let first = receiver.receive_up_to(3).expect("found");
+        if cfg!(windows) {
+            // Taken at once, no writer holding them, and no more than room
+            // for; let go without a verdict, they go back to be taken below.
+            assert_eq!(first.len(), 3, "as many as there was room for");
+        } else {
+            assert!(first.is_empty(), "found first");
+        }
+        drop(first);
         let mut took = 0;
         while took < 10 {
             let arrived = receiver.receive_up_to(3).expect("receiving");
@@ -548,6 +563,28 @@ mod tests {
             }
         }
         assert!(names(&dir).is_empty(), "every file taken in its turn");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_file_a_writer_holds_is_never_taken_and_one_let_go_is_taken_at_once() {
+        let dir = scratch("file-held");
+        let transport = on(&dir, 0);
+        let mut producer = File::create(dir.join("order.edi")).expect("a producer");
+        producer.write_all(b"ISA*00*").expect("writing");
+        producer.flush().expect("flushed");
+        // Unchanged across listings, and still held: a producer paused.
+        for _ in 0..3 {
+            assert!(transport.receive().expect("listing").is_empty(), "held");
+        }
+        drop(producer);
+        fs::write(dir.join("whole.edi"), b"GS*PO*").expect("written whole");
+        let arrived = transport.receive().expect("listing");
+        assert_eq!(arrived.len(), 2, "both taken by the first listing after");
+        for one in arrived {
+            one.taken().expect("accepted");
+        }
         fs::remove_dir_all(&dir).ok();
     }
 

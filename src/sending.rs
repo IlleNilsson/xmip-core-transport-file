@@ -18,6 +18,11 @@
 //! a piece of memory, never the file. Written, it is synced to disk and
 //! renamed over the target in one step:
 //! a receiver finds the target as it was before or whole, never in between.
+//! The rename waits until the Message is durable in the Ledger
+//! (`transport::Outgoing::kept`), so the write and its sync overlap the
+//! Ledger's own sync and no receiver finds a file the Ledger could lose
+//! (ADR-0018, amendment 2026-10-20). The directory is made only where it
+//! is not there, as the first file written in it finds.
 //! A rename replaces what it lands on (`std::fs::rename`: `MoveFileExW`
 //! with `MOVEFILE_REPLACE_EXISTING` on Windows, `rename(2)` on Unix), so a
 //! send to a name already there replaces that file, as writing it did.
@@ -41,15 +46,21 @@ use transport::error::{Result, classify};
 /// As the body could not be read, or the file system refused the write,
 /// the sync or the rename; the target is left as it was.
 pub(crate) fn send(path: &Path, claimant: &Claimant, outgoing: &Outgoing<'_>) -> Result<()> {
-    send_by(path, claimant, |file| outgoing.write_to(file).map(drop))
+    send_by(
+        path,
+        claimant,
+        |file| outgoing.write_to(file).map(drop),
+        || outgoing.kept(),
+    )
 }
 
-/// [`send`], writing through `write`: a test hands in a write that fails
-/// half way.
+/// [`send`], writing through `write` and renaming once `kept` returns: a
+/// test hands in a write that fails half way.
 fn send_by(
     path: &Path,
     claimant: &Claimant,
     write: impl FnOnce(&mut File) -> Result<()>,
+    kept: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     let refused = |e: &io::Error| classify("writing the sent file", e);
     let target = path
@@ -65,18 +76,33 @@ fn send_by(
     // removed: a node starting meanwhile passes over it.
     let unfinished = claimant.sending(target);
     let sending = path.with_file_name(unfinished.name());
-    let written = File::create_new(&sending)
+    let written = created(&sending)
         .map_err(|e| refused(&e))
         .and_then(|mut file| {
             write(&mut file)?;
             file.sync_all().map_err(|e| refused(&e))
         })
+        .and_then(|()| kept())
         .and_then(|()| fs::rename(&sending, path).map_err(|e| refused(&e)));
     if written.is_err() {
         let _ = fs::remove_file(&sending);
     }
     drop(unfinished);
     written
+}
+
+/// `path` created new, and its directory with it where that is not there
+/// yet: a Send Location never sent to, or its directory removed since.
+fn created(path: &Path) -> io::Result<File> {
+    match File::create_new(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if let Some(directory) = path.parent() {
+                fs::create_dir_all(directory)?;
+            }
+            File::create_new(path)
+        }
+        made => made,
+    }
 }
 
 #[cfg(test)]
@@ -137,11 +163,16 @@ mod tests {
         let target = dir.join("order.edi");
         fs::write(&target, b"before").expect("a file already there");
 
-        let failed = send_by(&target, &me(), |file| {
-            file.write_all(b"ISA")
-                .map_err(|e| classify("writing", &e))?;
-            Err(classify("writing", &io::Error::other("the disk is full")))
-        });
+        let failed = send_by(
+            &target,
+            &me(),
+            |file| {
+                file.write_all(b"ISA")
+                    .map_err(|e| classify("writing", &e))?;
+                Err(classify("writing", &io::Error::other("the disk is full")))
+            },
+            || Ok(()),
+        );
 
         assert!(failed.is_err());
         assert_eq!(fs::read(&target).expect("still there"), b"before");
@@ -224,17 +255,22 @@ mod tests {
             file.write_all(bytes).map_err(|e| classify("writing", &e))
         };
 
-        let sent = send_by(&target, &me(), |file| {
-            written(file, b"ISA")?;
-            // The same node builds a Receive Location over the directory
-            // and a Send Location to the target, as a node starting does.
-            for (at, side) in [(&directory, Applies::Receive), (&sent_to, Applies::Send)] {
-                FileTransport::open(at, side, &[])
-                    .and_then(|transport| transport.on_node(&node()))
-                    .expect("built on its node");
-            }
-            written(file, b"*00*")
-        });
+        let sent = send_by(
+            &target,
+            &me(),
+            |file| {
+                written(file, b"ISA")?;
+                // The same node builds a Receive Location over the directory
+                // and a Send Location to the target, as a node starting does.
+                for (at, side) in [(&directory, Applies::Receive), (&sent_to, Applies::Send)] {
+                    FileTransport::open(at, side, &[])
+                        .and_then(|transport| transport.on_node(&node()))
+                        .expect("built on its node");
+                }
+                written(file, b"*00*")
+            },
+            || Ok(()),
+        );
 
         sent.expect("sent whole");
         assert_eq!(fs::read(&target).expect("sent"), b"ISA*00*");
