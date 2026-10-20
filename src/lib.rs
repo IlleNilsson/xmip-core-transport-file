@@ -260,7 +260,7 @@ mod tests {
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
     use transport::Refusal;
-    use transport::claim::{Artefact, Claimant};
+    use transport::claim::{Artifact, Claimant};
     use transport::loopback::Loopback;
     use xcore::settings::Applies;
 
@@ -322,15 +322,11 @@ mod tests {
         assert_eq!(FileTransport::SETTINGS.settings, []);
         let transport = FileTransport::open("in", Applies::Receive, &[]).expect("configured");
         assert_eq!(transport.directory.root, PathBuf::from("in"));
-        let unknown = [("colour".to_string(), Given::Text("lime".to_string()))];
+        let unknown = [("color".to_string(), Given::Text("lime".to_string()))];
         let refused = FileTransport::open("in", Applies::Receive, &unknown)
             .err()
             .expect("refused");
-        assert!(
-            refused.message.contains("\"colour\""),
-            "{}",
-            refused.message
-        );
+        assert!(refused.message.contains("\"color\""), "{}", refused.message);
     }
 
     #[test]
@@ -340,7 +336,7 @@ mod tests {
         assert!(transport.directions().receives());
         assert!(transport.directions().sends());
         assert_eq!(transport.name(), "file");
-        assert!(transport.claims().is_some(), "files are artefacts");
+        assert!(transport.claims().is_some(), "files are artifacts");
     }
 
     #[test]
@@ -388,8 +384,8 @@ mod tests {
         fs::write(&sending, b"ISA*").expect("a send half way");
 
         assert!(settled(&transport).is_empty(), "not an arrival");
-        let artefact = Artefact::new(sending.to_string_lossy().into_owned());
-        assert!(!transport.is_available(&artefact).expect("asked"));
+        let artifact = Artifact::new(sending.to_string_lossy().into_owned());
+        assert!(!transport.is_available(&artifact).expect("asked"));
         assert_eq!(fs::read(&sending).expect("left alone"), b"ISA*");
 
         transport.send("order.edi", b"ISA*00*").expect("sending");
