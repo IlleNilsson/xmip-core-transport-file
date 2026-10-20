@@ -44,19 +44,23 @@ impl Directory {
     /// Every name in the directory, or none where it does not exist yet:
     /// a Receive Location nobody has sent to, a Send Location never sent.
     pub(crate) fn names(&self) -> Result<Vec<String>> {
+        self.each(|entry| entry.file_name().into_string().ok())
+    }
+
+    /// What `found` makes of every entry in the directory, where it makes
+    /// anything; nothing where the directory does not exist yet.
+    fn each<T>(&self, mut found: impl FnMut(&fs::DirEntry) -> Option<T>) -> Result<Vec<T>> {
         let entries = match fs::read_dir(&self.root) {
             Ok(entries) => entries,
             Err(ref e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(classify("reading the drop directory", &e)),
         };
-        let mut names = Vec::new();
+        let mut made = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|e| classify("listing the drop directory", &e))?;
-            if let Ok(name) = entry.file_name().into_string() {
-                names.push(name);
-            }
+            made.extend(found(&entry));
         }
-        Ok(names)
+        Ok(made)
     }
 }
 
@@ -72,16 +76,23 @@ pub(crate) fn stamp(path: &Path) -> Option<Stamp> {
 impl ClaimSite for Directory {
     type Stamp = Stamp;
 
-    /// Every file; the claim leaves out what is no arrival.
+    /// Every file, each stamped as the listing itself found it — on
+    /// Windows the directory read carries each entry's length and time, so
+    /// a listing asks nothing more of the file system per file — and a
+    /// link as what it leads to; the claim leaves out what is no arrival.
     fn listed(&self) -> Result<Vec<Listed<Stamp>>> {
-        Ok(self
-            .names()?
-            .into_iter()
-            .filter_map(|name| {
-                let found = stamp(&self.path(&name))?;
-                Some((name, Some(found)))
-            })
-            .collect())
+        self.each(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let metadata = entry.metadata().ok()?;
+            let found = if metadata.is_symlink() {
+                stamp(&entry.path())?
+            } else {
+                metadata
+                    .is_file()
+                    .then(|| (metadata.len(), metadata.modified().ok()))?
+            };
+            Some((name, Some(found)))
+        })
     }
 
     fn turns(&self) -> Result<Vec<String>> {
@@ -94,6 +105,30 @@ impl ClaimSite for Directory {
 
     fn stamp(&self, name: &str) -> Result<Option<Stamp>> {
         Ok(stamp(&self.path(name)))
+    }
+
+    /// On Windows, whether any handle still writes the file: an open that
+    /// shares reading and deleting, and not writing, is refused with a
+    /// sharing violation while one does — a producer writing it in place,
+    /// paused or not — and granted once none does, so a file renamed in
+    /// whole, or closed, is taken by the listing its change wakes. Anything
+    /// else the open meets — the file gone, access denied — leaves it to
+    /// the stability check.
+    #[cfg(windows)]
+    fn finished(&self, name: &str) -> Result<Option<bool>> {
+        use std::os::windows::fs::OpenOptionsExt;
+        // `FILE_SHARE_READ | FILE_SHARE_DELETE`, and `ERROR_SHARING_VIOLATION`.
+        const SHARE_READ_AND_DELETE: u32 = 0x1 | 0x4;
+        const SHARING_VIOLATION: i32 = 32;
+        let opened = OpenOptions::new()
+            .read(true)
+            .share_mode(SHARE_READ_AND_DELETE)
+            .open(self.path(name));
+        Ok(match opened {
+            Ok(_) => Some(true),
+            Err(e) if e.raw_os_error() == Some(SHARING_VIOLATION) => Some(false),
+            Err(_) => None,
+        })
     }
 
     /// Created only where nothing of its name exists, holding the
