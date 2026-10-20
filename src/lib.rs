@@ -46,11 +46,13 @@ mod sending;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+use context::property::FILE_NAME;
 use transport::Arrived;
 use transport::Configured;
 use transport::Directions;
 use transport::NodeLocation;
 use transport::Transport;
+use transport::TransportError;
 use transport::body::opened;
 use transport::claim::{Claimant, Claiming, Held, ResourceClaim, Site, Sited};
 use transport::error::{Result, classify};
@@ -65,7 +67,7 @@ pub struct FileTransport {
     /// its sends write beside their targets.
     claiming: Claiming<Stamp>,
     /// Whether it was built for a Send Location, whose address names the
-    /// file it writes, not a drop directory.
+    /// directory it writes its files in, not a drop directory.
     sends: bool,
 }
 
@@ -79,14 +81,43 @@ impl FileTransport {
         }
     }
 
-    /// The directory a send to this Location's address writes beside its
-    /// target in: the runtime sends a Send Location's Messages to its
-    /// address (`xmip-core-runtime`'s `departure`), so the file a send
-    /// writes is the address, read as [`FileTransport::send_from`] reads a
-    /// target.
-    fn beside_the_target(&self) -> Option<Directory> {
-        let target = self.directory.root.join(&self.directory.root);
-        target.parent().map(Directory::at)
+    /// The file a send writes in the directory: the name the Message
+    /// carries in its context (`context::property::FILE_NAME`), where the
+    /// runtime sent it — the Message's — or `target`, where a test or a
+    /// tool sent bytes it holds and named the file itself.
+    ///
+    /// # Errors
+    /// A Message carrying no file name, or a name that is not one file's in
+    /// this directory — empty, a path, `.` or `..` — permanently: asking
+    /// again names it no differently.
+    fn sent_to(&self, target: &str, outgoing: &transport::Outgoing<'_>) -> Result<PathBuf> {
+        let name = match outgoing.context() {
+            Some(context) => context
+                .get(FILE_NAME)
+                .and_then(xcore::ScalarValue::text)
+                .map(std::borrow::Cow::into_owned)
+                .ok_or_else(|| {
+                    TransportError::permanent(format!(
+                        "the Message carries no {FILE_NAME} to name its file by in '{}'",
+                        self.directory.root.display()
+                    ))
+                })?,
+            None => target.to_string(),
+        };
+        let plain = !name.is_empty()
+            && name != "."
+            && name != ".."
+            && !name.contains(['/', '\\', ':'])
+            && Path::new(&name)
+                .file_name()
+                .is_some_and(|file| file == name.as_str());
+        if !plain {
+            return Err(TransportError::permanent(format!(
+                "'{name}' names no file of its own in '{}'",
+                self.directory.root.display()
+            )));
+        }
+        Ok(self.directory.path(&name))
     }
 
     /// The claimed files this Location could not return yet, since a file
@@ -108,7 +139,10 @@ impl FileTransport {
             net::uri::path_of(&self.directory.path(dropped))
         );
         let read = self.directory.path(&claimed);
-        let owned = owner(&read);
+        // Its owner where the system says, and the name it was dropped
+        // under, which the Message Context keeps for a send to write it by.
+        let mut owned = owner(&read);
+        owned.push((FILE_NAME.to_string(), dropped.to_string()));
         let acknowledgement = self
             .claiming
             .acknowledgement(self.directory.clone(), claimed, true);
@@ -174,19 +208,17 @@ impl Transport for FileTransport {
         transport::Sending::Streamed("the file is written as the body is read")
     }
 
-    /// The body as the file `target` in the directory, written beside it
-    /// as it is read — a piece at a time, never whole in memory — and renamed
-    /// into place once whole, so no receiver finds it half written
-    /// (`sending.rs`). A file already of that name is replaced: one Journey
-    /// after another to a fixed name leaves the last one's file.
+    /// The body as a file in the directory the address names, under the
+    /// name the Message was received under ([`FileTransport::sent_to`]),
+    /// written beside it as it is read — a piece at a time, never whole in
+    /// memory — and renamed into place once whole, so no receiver finds it
+    /// half written (`sending.rs`). A file already of that name is
+    /// replaced: two Messages received under one name leave the last one's
+    /// file (ADR-0024, amendment 2026-10-20).
     fn send_from(&self, target: &str, outgoing: transport::Outgoing<'_>) -> Result<()> {
-        let path = self.directory.path(target);
-
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| classify("creating the send directory", &e))?;
-        }
-
+        let path = self.sent_to(target, &outgoing)?;
+        std::fs::create_dir_all(&self.directory.root)
+            .map_err(|e| classify("creating the send directory", &e))?;
         sending::send(&path, self.claiming.claimant(), &outgoing)
     }
 
@@ -213,14 +245,16 @@ impl Sited for FileTransport {
 
 impl Configured for FileTransport {
     /// The address is the directory: a Receive Location's drop directory, a
-    /// Send Location's target. Nothing else is read.
+    /// Send Location's directory it writes each Message's file in. Nothing
+    /// else is read.
     const SETTINGS: &'static Settings = &Settings::none(env!("CARGO_PKG_NAME"));
 
     fn configured(address: &str, _settings: &Read) -> Result<Self> {
         Ok(Self::new(address))
     }
 
-    /// Whether the Location sends: its address is then the file it writes.
+    /// Whether the Location sends: its address is then the directory it
+    /// writes in.
     fn sided(self, side: Applies) -> Self {
         Self {
             sends: side == Applies::Send,
@@ -236,16 +270,16 @@ impl Configured for FileTransport {
     /// dropped name a newer file has taken is held until the name is free
     /// — and removes its turns and the sent files its sends left
     /// unfinished there. A Send Location claims nothing, and removes the
-    /// sent files its node's sends left unfinished beside its target.
-    /// Another node's file is never touched, nor one a send of this
-    /// process is still writing.
+    /// sent files its node's sends left unfinished in the directory it
+    /// writes in. Another node's file is never touched, nor one a send of
+    /// this process is still writing.
     fn on_node(mut self, node: &NodeLocation) -> Result<Self> {
         self.claiming = Claiming::new(Claimant::of(node));
-        if !self.sends {
-            self.claiming.recover(&self.directory)?;
-        } else if let Some(beside) = self.beside_the_target() {
+        if self.sends {
             let claimant = self.claiming.claimant();
-            claimant.remove_unfinished(&beside, beside.names()?)?;
+            claimant.remove_unfinished(&self.directory, self.directory.names()?)?;
+        } else {
+            self.claiming.recover(&self.directory)?;
         }
         Ok(self)
     }
@@ -765,13 +799,13 @@ mod tests {
     }
 
     #[test]
-    fn a_starting_send_location_removes_what_its_node_left_beside_the_target() {
+    fn a_starting_send_location_removes_what_its_node_left_in_its_directory() {
         let dir = scratch("file-left-send");
         let target = dir.join("billing.edi");
         fs::write(&target, b"sent before").expect("a file sent before");
         let mine = left_half_sent(&dir, 0, "billing.edi");
         let theirs = left_half_sent(&dir, 1, "billing.edi");
-        let address = target.to_str().expect("a UTF-8 path");
+        let address = dir.to_str().expect("a UTF-8 path");
 
         let sending = FileTransport::open(address, Applies::Send, &[])
             .and_then(|transport| transport.on_node(&node(0)))
@@ -780,9 +814,82 @@ mod tests {
         let after = names(&dir);
         assert!(!after.contains(&mine), "its own removed: {after:?}");
         assert!(after.contains(&theirs), "another node's kept: {after:?}");
-        sending.send(address, b"ISA*00*").expect("sending");
+        sending.send("billing.edi", b"ISA*00*").expect("sending");
         assert_eq!(fs::read(&target).expect("sent"), b"ISA*00*");
         assert_eq!(names(&dir).len(), 2, "{:?}", names(&dir));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A Message's context, received as the file `name`.
+    fn received_as(name: &str) -> context::MessageContext {
+        context::MessageContext::new()
+            .with_value(FILE_NAME, xcore::ScalarValue::Text(name.to_string()))
+    }
+
+    #[test]
+    fn a_message_is_written_in_the_directory_under_the_name_it_was_received_under() {
+        let dir = scratch("file-send-named");
+        let address = dir.join("out");
+        let address = address.to_str().expect("a UTF-8 path");
+        let sending = FileTransport::open(address, Applies::Send, &[])
+            .and_then(|transport| transport.on_node(&node(0)))
+            .expect("built on its node");
+        let context = received_as("order-1001.edi");
+
+        sending
+            .send_from(
+                address,
+                transport::Outgoing::held(b"ISA").carrying(&context),
+            )
+            .expect("sent");
+
+        let written = fs::read(dir.join("out").join("order-1001.edi")).expect("written");
+        assert_eq!(written, b"ISA");
+        assert_eq!(names(&dir.join("out")).len(), 1);
+        // Relative, as a configuration writes it: the file in the
+        // directory, never in the directory inside itself.
+        let relative = FileTransport::open("out", Applies::Send, &[]).expect("configured");
+        let held = transport::Outgoing::held(b"ISA").carrying(&context);
+        assert_eq!(
+            relative.sent_to("out", &held).expect("named"),
+            Path::new("out").join("order-1001.edi")
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_message_with_no_file_name_or_a_path_for_one_is_refused_in_words() {
+        let dir = scratch("file-send-unnamed");
+        let sending = FileTransport::new(&dir);
+        let unnamed = context::MessageContext::new();
+        let outgoing = transport::Outgoing::held(b"ISA").carrying(&unnamed);
+
+        let refused = sending.send_from("ignored", outgoing).expect_err("no name");
+        assert!(!refused.retryable);
+        assert!(refused.message.contains(FILE_NAME), "{}", refused.message);
+        for name in ["../escaped.edi", "sub/order.edi", "..", ""] {
+            let context = received_as(name);
+            let outgoing = transport::Outgoing::held(b"ISA").carrying(&context);
+            let refused = sending.send_from("ignored", outgoing).expect_err(name);
+            assert!(
+                refused.message.contains("names no file"),
+                "{}",
+                refused.message
+            );
+        }
+        assert!(names(&dir).is_empty(), "{:?}", names(&dir));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_dropped_file_says_the_name_it_was_dropped_under() {
+        let dir = scratch("file-dropped-name");
+        let transport = FileTransport::new(&dir);
+        transport.send("order-7.edi", b"ISA").expect("sending");
+
+        let mut arrived = settled(&transport);
+        let taken = arrived.remove(0).taken().expect("taken");
+        assert_eq!(taken.observation(FILE_NAME), Some("order-7.edi"));
         fs::remove_dir_all(&dir).ok();
     }
 
