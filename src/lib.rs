@@ -58,7 +58,7 @@ use transport::TransportError;
 use transport::body::opened;
 use transport::claim::{Claimant, Claiming, Held, ResourceClaim, Site, Sited};
 use transport::error::{Result, classify};
-use xcore::settings::{Applies, Read, Settings};
+use xcore::settings::{Applies, Kind, Presence, Read, Setting, Settings};
 
 pub use crate::directory::{Directory, Stamp};
 
@@ -71,7 +71,15 @@ pub struct FileTransport {
     /// Whether it was built for a Send Location, whose address names the
     /// directory it writes its files in, not a drop directory.
     sends: bool,
+    /// What a Send Location names the file of a Message carrying no
+    /// `file.name` by: its `name` setting, `{message}` the Message's
+    /// identifier; the identifier alone where it has none.
+    pattern: Option<String>,
 }
+
+/// What a file Send Location's `name` pattern writes the Message's
+/// identifier as.
+pub const MESSAGE: &str = "{message}";
 
 impl FileTransport {
     #[must_use]
@@ -80,27 +88,41 @@ impl FileTransport {
             directory: Directory::at(root),
             claiming: Claiming::new(Claimant::process()),
             sends: false,
+            pattern: None,
         }
+    }
+
+    /// Name the file of a Message carrying no `file.name` by `pattern`,
+    /// [`MESSAGE`] in it the Message's identifier.
+    #[must_use]
+    pub fn naming(mut self, pattern: impl Into<String>) -> Self {
+        self.pattern = Some(pattern.into());
+        self
     }
 
     /// The file a send writes in the directory: the name the Message
     /// carries in its context (`context::property::FILE_NAME`), where the
-    /// runtime sent it — the Message's — or `target`, where a test or a
-    /// tool sent bytes it holds and named the file itself.
+    /// runtime sent it; where it carries none, the Send Location's `name`
+    /// pattern, [`MESSAGE`] in it the Message's identifier, or the
+    /// identifier itself where the Location names no pattern (the owner,
+    /// 2026-10-21); or `target`, where a test or a tool sent bytes it holds
+    /// and named the file itself.
     ///
     /// # Errors
-    /// A Message carrying no file name, or a name that is not one file's in
-    /// this directory — empty, a path, `.` or `..` — permanently: asking
-    /// again names it no differently.
+    /// A Message carrying neither a file name nor an identifier, or a name
+    /// that is not one file's in this directory — empty, a path, `.` or
+    /// `..` — permanently: asking again names it no differently.
     fn sent_to(&self, target: &str, outgoing: &transport::Outgoing<'_>) -> Result<PathBuf> {
         let name = match outgoing.context() {
             Some(context) => context
                 .get(FILE_NAME)
                 .and_then(xcore::ScalarValue::text)
                 .map(std::borrow::Cow::into_owned)
+                .or_else(|| outgoing.message().map(|message| self.patterned(message)))
                 .ok_or_else(|| {
                     TransportError::permanent(format!(
-                        "the Message carries no {FILE_NAME} to name its file by in '{}'",
+                        "the Message carries no {FILE_NAME} and no identifier to name its file \
+                         by in '{}'",
                         self.directory.root.display()
                     ))
                 })?,
@@ -120,6 +142,15 @@ impl FileTransport {
             )));
         }
         Ok(self.directory.path(&name))
+    }
+
+    /// The name the Location's pattern gives the Message `message`, or the
+    /// identifier itself where it has none.
+    fn patterned(&self, message: &str) -> String {
+        self.pattern.as_deref().map_or_else(
+            || message.to_string(),
+            |pattern| pattern.replace(MESSAGE, message),
+        )
     }
 
     /// The claimed files this Location could not return yet, since a file
@@ -255,12 +286,28 @@ impl Sited for FileTransport {
 
 impl Configured for FileTransport {
     /// The address is the directory: a Receive Location's drop directory, a
-    /// Send Location's directory it writes each Message's file in. Nothing
-    /// else is read.
-    const SETTINGS: &'static Settings = &Settings::none(env!("CARGO_PKG_NAME"));
+    /// Send Location's directory it writes each Message's file in. A Send
+    /// Location's `name` names the file of a Message carrying no
+    /// `file.name`.
+    const SETTINGS: &'static Settings = &Settings {
+        technology: env!("CARGO_PKG_NAME"),
+        settings: &[Setting {
+            name: "name",
+            kind: Kind::Text,
+            presence: Presence::Optional,
+            meaning: "The file name a Message carrying no file.name is written under, \
+                      {message} in it the Message's identifier; the identifier alone when \
+                      left out.",
+            applies: Applies::Send,
+        }],
+    };
 
-    fn configured(address: &str, _settings: &Read) -> Result<Self> {
-        Ok(Self::new(address))
+    fn configured(address: &str, settings: &Read) -> Result<Self> {
+        let transport = Self::new(address);
+        Ok(match settings.optional_text("name") {
+            Some(pattern) => transport.naming(pattern),
+            None => transport,
+        })
     }
 
     /// Whether the Location sends: its address is then the directory it
@@ -363,9 +410,15 @@ mod tests {
     }
 
     #[test]
-    fn file_declares_it_takes_nothing_beyond_its_directory() {
+    fn file_declares_a_send_name_and_nothing_else_beyond_its_directory() {
         use xcore::settings::Given;
-        assert_eq!(FileTransport::SETTINGS.settings, []);
+        assert_eq!(FileTransport::SETTINGS.problems(), Vec::<String>::new());
+        let declared: Vec<_> = FileTransport::SETTINGS
+            .settings
+            .iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(declared, ["name"]);
         let transport = FileTransport::open("in", Applies::Receive, &[]).expect("configured");
         assert_eq!(transport.directory.root, PathBuf::from("in"));
         let unknown = [("color".to_string(), Given::Text("lime".to_string()))];
@@ -373,6 +426,16 @@ mod tests {
             .err()
             .expect("refused");
         assert!(refused.message.contains("\"color\""), "{}", refused.message);
+        let named = [(
+            "name".to_string(),
+            Given::Text("order-{message}.edi".to_string()),
+        )];
+        let sending = FileTransport::open("out", Applies::Send, &named).expect("configured");
+        assert_eq!(sending.pattern.as_deref(), Some("order-{message}.edi"));
+        assert!(
+            FileTransport::open("in", Applies::Receive, &named).is_err(),
+            "a Receive Location names no sent file"
+        );
     }
 
     #[test]
@@ -917,6 +980,50 @@ mod tests {
             );
         }
         assert!(names(&dir).is_empty(), "{:?}", names(&dir));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_message_with_no_file_name_is_named_by_the_pattern_or_its_identifier() {
+        let dir = scratch("file-send-pattern");
+        let unnamed = context::MessageContext::new();
+        let message = "0199f0a1-7c2e-7000-8000-000000000001";
+        let outgoing = || {
+            transport::Outgoing::held(b"ISA")
+                .carrying(&unnamed)
+                .of_message(message)
+        };
+
+        FileTransport::new(&dir)
+            .send_from("ignored", outgoing())
+            .expect("named by its identifier");
+        assert_eq!(fs::read(dir.join(message)).expect("written"), b"ISA");
+
+        let patterned = FileTransport::new(&dir).naming("order-{message}.edi");
+        patterned
+            .send_from("ignored", outgoing())
+            .expect("named by the pattern");
+        let by_pattern = dir.join(format!("order-{message}.edi"));
+        assert_eq!(fs::read(by_pattern).expect("written"), b"ISA");
+
+        // A name the Message carries goes first, the pattern after.
+        let carried = received_as("order-7.edi");
+        let named = transport::Outgoing::held(b"GS")
+            .carrying(&carried)
+            .of_message(message);
+        patterned.send_from("ignored", named).expect("its own name");
+        assert_eq!(fs::read(dir.join("order-7.edi")).expect("written"), b"GS");
+        // A pattern that names a path is refused as any other name is.
+        let escaping = FileTransport::new(&dir).naming("../{message}");
+        let refused = escaping
+            .send_from("ignored", outgoing())
+            .expect_err("a path");
+        assert!(
+            refused.message.contains("names no file"),
+            "{}",
+            refused.message
+        );
+        assert_eq!(names(&dir).len(), 3, "{:?}", names(&dir));
         fs::remove_dir_all(&dir).ok();
     }
 
