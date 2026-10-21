@@ -141,18 +141,25 @@ amendment 2026-10-20). A file Receive Location writes the name a file was
 dropped under on its arrival as `file.name` (`context::property::FILE_NAME`),
 the runtime keeps it in the Message Context, and a send reads it from the
 context the runtime hands it (`transport::Outgoing::context`). A Message
-carrying no `file.name` — one received over another transport — or one
-naming a path rather than a file (`..`, `sub/order.edi`) is refused in
-words, permanently, and nothing is written. A test or a tool that sends
-bytes it holds names the file itself, as the send's target. Until
-2026-10-20 the address named one file, and a relative address was written
-inside itself (`out/out`).
+carrying no `file.name` — one received over another transport — is named
+from the pattern the Send Location's `name` setting gives, `{message}` in
+it the Message's identifier, which the runtime hands every send
+(`transport::Outgoing::message`), and by the identifier alone where the
+Location gives no pattern (the owner, 2026-10-21; ADR-0024, amendment
+2026-10-21); until then such a Message was refused. A name naming a path
+rather than a file (`..`, `sub/order.edi`), the pattern's as any other, is
+refused in words, permanently, and nothing is written. A test or a tool
+that sends bytes it holds names the file itself, as the send's target.
+Until 2026-10-20 the address named one file, and a relative address was
+written inside itself (`out/out`).
 
 ```toml
 [[applications.send_ports]]
 name = "Out"
 transport = "xmip-core-transport-file"
 address = "out"                  # out/order-1001.edi, for order-1001.edi dropped in
+[applications.send_ports.settings]
+name = "order-{message}.edi"     # out/order-<identifier>.edi, for one received otherwise
 ```
 
 A send writes the file beside its target as the Message is read from the
