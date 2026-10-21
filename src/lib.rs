@@ -40,6 +40,8 @@
 //! the next receive.
 
 mod directory;
+#[cfg(windows)]
+mod holding;
 mod loopback;
 mod sending;
 

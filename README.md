@@ -50,10 +50,22 @@ order.edi.xmip-claim.<the node's location, percent-encoded>.<nanoseconds since 1
 
 Two renames of one file are not exclusive — Windows renames through a handle
 opened on the file first, so two nodes that both open it both rename it — so
-the rename is made holding the file's turn, `order.edi.xmip-claim`, created
-only where it does not exist and removed once the rename is done; a node
-that finds the turn taken leaves the file to its next listing. A claimed
-name, and a turn, are never an arrival.
+the rename is made holding the file's turn; a node that finds the turn taken
+leaves the file to its next listing. **On Windows the turn is the dropped
+file held open** (ADR-0024, amendment 2026-10-21): opened to write, sharing
+reading and deleting and never writing, so no other node opens it so while
+one holds it and no producer still writing it lets it be opened at all —
+the same open says the file is finished — and the rename, which opens the
+file to delete it, goes through. Nothing is written through it, and it ends
+with the handle. Elsewhere, and on Windows where that open is refused for
+anything but another's handle, the turn is a file, `order.edi.xmip-claim`,
+created only where it does not exist and removed once the rename is done.
+The open took the place of a turn file created, written, closed and
+removed, and of an open that asked whether a writer still held the file:
+a dropped file's claim went from about 3.0 ms to 2.2 ms on an idle
+machine, and from about 5 ms to 2.1 ms beside four processor-bound jobs
+and a disk kept busy (open problem 33, 2026-10-21). A claimed name, and a
+turn, are never an arrival.
 
 A receive claims no more files than the runtime has room for
 (`Transport::receive_up_to`): the rest of a listing stay as they were
