@@ -17,6 +17,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+#[cfg(windows)]
+use transport::claim::TURN;
 use transport::claim::{ClaimSite, Listed, Restore, is_turn};
 use transport::error::{Result, classify};
 
@@ -29,11 +31,38 @@ pub type Stamp = (u64, Option<SystemTime>);
 #[derive(Clone, Debug)]
 pub struct Directory {
     pub(crate) root: PathBuf,
+    /// The files held open as their turns, on Windows (`holding.rs`).
+    #[cfg(windows)]
+    holding: crate::holding::Holding,
 }
 
 impl Directory {
     pub(crate) fn at(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            #[cfg(windows)]
+            holding: crate::holding::Holding::default(),
+        }
+    }
+
+    /// The turn `turn` as a file: created only where none of its name
+    /// exists, holding the claimant's name. Anything the file system
+    /// refuses — the name taken, a turn being removed — is the turn not had
+    /// now.
+    fn file_turn(&self, turn: &str, claimant: &str) -> bool {
+        let Ok(mut held) = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(self.path(turn))
+        else {
+            return false;
+        };
+        if held.write_all(claimant.as_bytes()).is_err() {
+            drop(held);
+            let _ = fs::remove_file(self.path(turn));
+            return false;
+        }
+        true
     }
 
     /// Where `name` lies.
@@ -103,51 +132,39 @@ impl ClaimSite for Directory {
             .collect())
     }
 
+    /// On Windows through the handle its turn holds, where it is held.
     fn stamp(&self, name: &str) -> Result<Option<Stamp>> {
+        #[cfg(windows)]
+        if let Some(stamp) = self.holding.stamp(name) {
+            return Ok(Some(stamp));
+        }
         Ok(stamp(&self.path(name)))
     }
 
-    /// On Windows, whether any handle still writes the file: an open that
-    /// shares reading and deleting, and not writing, is refused with a
-    /// sharing violation while one does — a producer writing it in place,
-    /// paused or not — and granted once none does, so a file renamed in
-    /// whole, or closed, is taken by the listing its change wakes. Anything
-    /// else the open meets — the file gone, access denied — leaves it to
-    /// the stability check.
+    /// On Windows, whether any handle still writes the file, asked by
+    /// taking its turn (`holding.rs`): the open is refused with a sharing
+    /// violation while one does — a producer writing it in place, paused or
+    /// not — and granted once none does, so a file renamed in whole, or
+    /// closed, is taken by the listing its change wakes, and the claim that
+    /// follows holds its turn already. Anything else the open meets — the
+    /// file gone, access denied — leaves it to the stability check.
     #[cfg(windows)]
     fn finished(&self, name: &str) -> Result<Option<bool>> {
-        use std::os::windows::fs::OpenOptionsExt;
-        // `FILE_SHARE_READ | FILE_SHARE_DELETE`, and `ERROR_SHARING_VIOLATION`.
-        const SHARE_READ_AND_DELETE: u32 = 0x1 | 0x4;
-        const SHARING_VIOLATION: i32 = 32;
-        let opened = OpenOptions::new()
-            .read(true)
-            .share_mode(SHARE_READ_AND_DELETE)
-            .open(self.path(name));
-        Ok(match opened {
-            Ok(_) => Some(true),
-            Err(e) if e.raw_os_error() == Some(SHARING_VIOLATION) => Some(false),
-            Err(_) => None,
-        })
+        Ok(self.holding.take(&self.root, name))
     }
 
-    /// Created only where nothing of its name exists, holding the
-    /// claimant's name. Anything the file system refuses — the name taken,
-    /// a turn being removed — is the turn not had now.
+    /// On Windows the dropped file held open (`holding.rs`), where the
+    /// open is not refused for anything but another's handle; elsewhere,
+    /// and there, a file created only where nothing of its name exists,
+    /// holding the claimant's name.
     fn take_turn(&self, turn: &str, claimant: &str) -> Result<bool> {
-        let Ok(mut held) = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(self.path(turn))
-        else {
-            return Ok(false);
-        };
-        if held.write_all(claimant.as_bytes()).is_err() {
-            drop(held);
-            let _ = fs::remove_file(self.path(turn));
-            return Ok(false);
+        #[cfg(windows)]
+        if let Some(dropped) = turn.strip_suffix(TURN)
+            && let Some(had) = self.holding.take(&self.root, dropped)
+        {
+            return Ok(had);
         }
-        Ok(true)
+        Ok(self.file_turn(turn, claimant))
     }
 
     fn holder(&self, turn: &str) -> Result<Option<String>> {
@@ -156,7 +173,15 @@ impl ClaimSite for Directory {
             .and_then(|held| String::from_utf8(held).ok()))
     }
 
+    /// The handle closed, where the turn was one; the file removed
+    /// otherwise.
     fn drop_turn(&self, turn: &str, _claimant: &str) -> Result<()> {
+        #[cfg(windows)]
+        if let Some(dropped) = turn.strip_suffix(TURN)
+            && self.holding.let_go(dropped)
+        {
+            return Ok(());
+        }
         match fs::remove_file(self.path(turn)) {
             Err(ref e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             done => done.map_err(|e| classify("removing a turn", &e)),
@@ -301,5 +326,48 @@ mod tests {
             .expect("dropped");
         assert_eq!(directory.turns().expect("listed"), [] as [String; 0]);
         let _ = fs::remove_dir_all(&directory.root);
+    }
+
+    /// On Windows a dropped file's turn is the file held open: had by one
+    /// claimant at a time, refused while a producer writes it, the rename
+    /// let through, and nothing left in the directory.
+    #[cfg(windows)]
+    #[test]
+    fn a_dropped_files_turn_is_the_file_held_open() {
+        let claimed = claimed_in("file-held-turn");
+        let root = claimed.parent().expect("its directory").to_path_buf();
+        fs::write(root.join("order.edi"), b"dropped").expect("dropped");
+        let (one, two) = (Directory::at(&root), Directory::at(&root));
+        let turn = "order.edi.xmip-claim";
+
+        assert_eq!(one.finished("order.edi").expect("asked"), Some(true));
+        assert!(one.take_turn(turn, "one").expect("had"));
+        assert_eq!(two.finished("order.edi").expect("asked"), Some(false));
+        assert!(!two.take_turn(turn, "two").expect("asked"));
+        assert_eq!(one.turns().expect("listed"), [] as [String; 0]);
+        assert_eq!(
+            one.stamp("order.edi").expect("stamped"),
+            stamp(&root.join("order.edi"))
+        );
+        assert!(one.rename("order.edi", "order.edi.claimed").expect("asked"));
+        one.drop_turn(turn, "one").expect("let go");
+        assert_eq!(
+            fs::read(root.join("order.edi.claimed")).expect("claimed"),
+            b"dropped"
+        );
+
+        let writing = fs::File::create(root.join("being-written.edi")).expect("a producer");
+        assert_eq!(
+            one.finished("being-written.edi").expect("asked"),
+            Some(false)
+        );
+        drop(writing);
+        assert_eq!(
+            one.finished("being-written.edi").expect("asked"),
+            Some(true)
+        );
+        one.drop_turn("being-written.edi.xmip-claim", "one")
+            .expect("let go");
+        let _ = fs::remove_dir_all(&root);
     }
 }
