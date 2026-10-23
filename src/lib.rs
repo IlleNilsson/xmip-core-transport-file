@@ -54,10 +54,10 @@ use transport::Configured;
 use transport::Directions;
 use transport::NodeLocation;
 use transport::Transport;
-use transport::TransportError;
 use transport::body::opened;
 use transport::claim::{Claimant, Claiming, Held, ResourceClaim, Site, Sited};
 use transport::error::{Result, classify};
+use transport::file_name::file_name;
 use xcore::settings::{Applies, Kind, Presence, Read, Setting, Settings};
 
 pub use crate::directory::{Directory, Stamp};
@@ -77,10 +77,6 @@ pub struct FileTransport {
     pattern: Option<String>,
 }
 
-/// What a file Send Location's `name` pattern writes the Message's
-/// identifier as.
-pub const MESSAGE: &str = "{message}";
-
 impl FileTransport {
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -93,64 +89,26 @@ impl FileTransport {
     }
 
     /// Name the file of a Message carrying no `file.name` by `pattern`,
-    /// [`MESSAGE`] in it the Message's identifier.
+    /// [`MESSAGE`](transport::file_name::MESSAGE) in it the Message's
+    /// identifier.
     #[must_use]
     pub fn naming(mut self, pattern: impl Into<String>) -> Self {
         self.pattern = Some(pattern.into());
         self
     }
 
-    /// The file a send writes in the directory: the name the Message
-    /// carries in its context (`context::property::FILE_NAME`), where the
-    /// runtime sent it; where it carries none, the Send Location's `name`
-    /// pattern, [`MESSAGE`] in it the Message's identifier, or the
-    /// identifier itself where the Location names no pattern (the owner,
-    /// 2026-10-21); or `target`, where a test or a tool sent bytes it holds
-    /// and named the file itself.
+    /// The file a send writes in the directory: the file family's one name
+    /// for it (`transport::file_name`), the Send Location's `name` its
+    /// pattern; `target`, where a test or a tool sent bytes it holds and
+    /// named the file itself.
     ///
     /// # Errors
-    /// A Message carrying neither a file name nor an identifier, or a name
-    /// that is not one file's in this directory — empty, a path, `.` or
-    /// `..` — permanently: asking again names it no differently.
+    /// As `transport::file_name::file_name`: no name, or one that is not one
+    /// file's in this directory, permanently.
     fn sent_to(&self, target: &str, outgoing: &transport::Outgoing<'_>) -> Result<PathBuf> {
-        let name = match outgoing.context() {
-            Some(context) => context
-                .get(FILE_NAME)
-                .and_then(xcore::ScalarValue::text)
-                .map(std::borrow::Cow::into_owned)
-                .or_else(|| outgoing.message().map(|message| self.patterned(message)))
-                .ok_or_else(|| {
-                    TransportError::permanent(format!(
-                        "the Message carries no {FILE_NAME} and no identifier to name its file \
-                         by in '{}'",
-                        self.directory.root.display()
-                    ))
-                })?,
-            None => target.to_string(),
-        };
-        let plain = !name.is_empty()
-            && name != "."
-            && name != ".."
-            && !name.contains(['/', '\\', ':'])
-            && Path::new(&name)
-                .file_name()
-                .is_some_and(|file| file == name.as_str());
-        if !plain {
-            return Err(TransportError::permanent(format!(
-                "'{name}' names no file of its own in '{}'",
-                self.directory.root.display()
-            )));
-        }
+        let place = self.directory.root.display().to_string();
+        let name = file_name(outgoing, self.pattern.as_deref(), target, &place)?;
         Ok(self.directory.path(&name))
-    }
-
-    /// The name the Location's pattern gives the Message `message`, or the
-    /// identifier itself where it has none.
-    fn patterned(&self, message: &str) -> String {
-        self.pattern.as_deref().map_or_else(
-            || message.to_string(),
-            |pattern| pattern.replace(MESSAGE, message),
-        )
     }
 
     /// The claimed files this Location could not return yet, since a file
