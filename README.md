@@ -146,7 +146,9 @@ from the pattern the Send Location's `name` setting gives, `{message}` in
 it the Message's identifier, which the runtime hands every send
 (`transport::Outgoing::message`), and by the identifier alone where the
 Location gives no pattern (the owner, 2026-10-21; ADR-0024, amendment
-2026-10-21); until then such a Message was refused. A name naming a path
+2026-10-21); until then such a Message was refused. The naming is the
+file family's, in the transport capability (`transport::file_name`), which
+the SFTP transport names by too. A name naming a path
 rather than a file (`..`, `sub/order.edi`), the pattern's as any other, is
 refused in words, permanently, and nothing is written. A test or a tool
 that sends bytes it holds names the file itself, as the send's target.
