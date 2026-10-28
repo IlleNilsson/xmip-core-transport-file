@@ -489,7 +489,7 @@ mod tests {
         let held = names(&dir);
         assert!(!held.contains("order.edi"), "claimed, it is gone: {held:?}");
         let claimed = held.iter().next().expect("the claimed file");
-        let encoded = net::percent::encode_keeping(node(0).as_str(), |byte| {
+        let encoded = codec::percent::encode_keeping(node(0).as_str(), |byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
         });
         assert!(
