@@ -158,7 +158,6 @@ written inside itself (`out/out`).
 ```toml
 [[applications.send_ports]]
 name = "Out"
-transport = "xmip-core-transport-file"
 address = "out"                  # out/order-1001.edi, for order-1001.edi dropped in
 [applications.send_ports.settings]
 name = "order-{message}.edi"     # out/order-<identifier>.edi, for one received otherwise
@@ -209,3 +208,7 @@ here.
 
 The included workflow is manual-only and calls the versioned shared workflow at
 `IlleNilsson/.github@v1`.
+
+## The address alone
+
+A Location is entered by its address (ADR-0064, amendment 2026-10-28): a path — `/var/xmip/in`, `C:\xmip\in` — or a `file://` URI (RFC 8089): `file:///var/xmip/in` is `/var/xmip/in`, `file:///C:/xmip/in` is `C:/xmip/in`, `file://host/share/in` the share `//host/share/in` (`FileTransport::own_terms`). An address with no scheme is always the file transport's.

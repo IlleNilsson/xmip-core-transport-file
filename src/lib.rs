@@ -136,7 +136,7 @@ impl FileTransport {
         owned.push((FILE_NAME.to_string(), dropped.to_string()));
         let acknowledgement = self
             .claiming
-            .acknowledgement(self.directory.clone(), claimed, true);
+            .acknowledgement(self.directory.clone(), claimed);
         // Opened on its first read, so a drop directory of many files holds
         // one handle per file being read, not one per file listed.
         let body =
@@ -259,6 +259,25 @@ impl Configured for FileTransport {
             applies: Applies::Send,
         }],
     };
+
+    /// `file://`, and a path entered with no scheme at all (RFC 8089).
+    const SCHEMES: &'static [&'static str] = &["file"];
+
+    /// The directory a `file://` address names (RFC 8089): `file:///var/drop`
+    /// is `/var/drop`, `file:///C:/drop` is `C:/drop`, `file://host/share`
+    /// is the share `//host/share`; a path entered without a scheme is
+    /// the path.
+    fn own_terms(address: &str) -> &str {
+        let Some(named) = net::Target::under(Self::SCHEMES, address) else {
+            return address;
+        };
+        let path = named.after_scheme();
+        if path.starts_with('/') {
+            net::uri::file_text_of(path)
+        } else {
+            &address[address.len() - path.len() - 2..]
+        }
+    }
 
     fn configured(address: &str, settings: &Read) -> Result<Self> {
         let transport = Self::new(address);
@@ -394,6 +413,19 @@ mod tests {
             FileTransport::open("in", Applies::Receive, &named).is_err(),
             "a Receive Location names no sent file"
         );
+    }
+
+    #[test]
+    fn a_file_address_names_its_directory_as_a_path_entered_bare_does() {
+        for (entered, directory) in [
+            ("file:///var/xmip/in", "/var/xmip/in"),
+            ("FILE:///C:/xmip/in", "C:/xmip/in"),
+            ("file://host/share/in", "//host/share/in"),
+            ("C:\\xmip\\in", "C:\\xmip\\in"),
+            ("in", "in"),
+        ] {
+            assert_eq!(FileTransport::own_terms(entered), directory, "{entered}");
+        }
     }
 
     #[test]
