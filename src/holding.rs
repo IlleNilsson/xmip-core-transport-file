@@ -19,7 +19,8 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
+use xcore::lock::Locked;
 
 use crate::directory::Stamp;
 
@@ -45,7 +46,7 @@ impl Holding {
     /// claimant's or a producer's — and `None` where the open was refused
     /// for anything else. One held already is held.
     pub(crate) fn take(&self, root: &Path, name: &str) -> Option<bool> {
-        let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut held = self.0.locked();
         if held.contains_key(name) {
             return Some(true);
         }
@@ -66,14 +67,14 @@ impl Holding {
     /// The stamp of `name` through its handle, where it is held and the
     /// handle answers: `None` otherwise, for the path to answer.
     pub(crate) fn stamp(&self, name: &str) -> Option<Stamp> {
-        let held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let held = self.0.locked();
         let metadata = held.get(name)?.metadata().ok()?;
         Some((metadata.len(), metadata.modified().ok()))
     }
 
     /// The turn of `name` let go: whether it was held.
     pub(crate) fn let_go(&self, name: &str) -> bool {
-        let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut held = self.0.locked();
         held.remove(name).is_some()
     }
 }
