@@ -148,25 +148,32 @@ impl FileTransport {
     }
 }
 
-/// Who owns the file at `path` and what it permits, as the system says
-/// without unsafe code: on Unix its user and group ids and its permission
-/// bits; nothing on Windows, whose owner is a security descriptor only an
-/// unsafe call reads.
-#[cfg(unix)]
-fn owner(path: &Path) -> Vec<(String, String)> {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path).map_or_else(
-        |_| Vec::new(),
-        |metadata| {
-            transport::arrival_identity::file_owner(metadata.uid(), metadata.gid(), metadata.mode())
-        },
-    )
-}
-
-/// Nothing: see the Unix `owner`.
-#[cfg(not(unix))]
-fn owner(_: &Path) -> Vec<(String, String)> {
-    Vec::new()
+cfg_select! {
+    unix => {
+        /// Who owns the file at `path` and what it permits, as the system
+        /// says without unsafe code: on Unix its user and group ids and its
+        /// permission bits; nothing on Windows, whose owner is a security
+        /// descriptor only an unsafe call reads.
+        fn owner(path: &Path) -> Vec<(String, String)> {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(path).map_or_else(
+                |_| Vec::new(),
+                |metadata| {
+                    transport::arrival_identity::file_owner(
+                        metadata.uid(),
+                        metadata.gid(),
+                        metadata.mode(),
+                    )
+                },
+            )
+        }
+    }
+    _ => {
+        /// Nothing: see the Unix `owner`.
+        fn owner(_: &Path) -> Vec<(String, String)> {
+            Vec::new()
+        }
+    }
 }
 
 impl Transport for FileTransport {
