@@ -249,6 +249,7 @@ fn restore_by(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     /// A claimed file `order.edi` in a fresh scratch directory, holding
     /// `claimed`.
@@ -269,8 +270,9 @@ mod tests {
 
         let kept = restore_by(&claimed, &dropped, |from, to| fs::hard_link(from, to));
 
-        assert!(
-            matches!(kept, Ok(Restore::Kept(ref why)) if why.contains("dropped since")),
+        assert_matches!(
+            kept,
+            Ok(Restore::Kept(ref why)) if why.contains("dropped since"),
             "{kept:?}"
         );
         assert_eq!(fs::read(&dropped).expect("the newer file"), b"newer");
@@ -290,8 +292,9 @@ mod tests {
             Err(io::Error::from(io::ErrorKind::Unsupported))
         });
 
-        assert!(
-            matches!(kept, Ok(Restore::Kept(ref why)) if why.contains("no hard link")),
+        assert_matches!(
+            kept,
+            Ok(Restore::Kept(ref why)) if why.contains("no hard link"),
             "{kept:?}"
         );
         assert_eq!(fs::read(&dropped).expect("the newer file"), b"newer");
