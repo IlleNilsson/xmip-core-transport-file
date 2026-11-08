@@ -21,8 +21,13 @@
 //! The rename waits until the Message is durable in the Ledger
 //! (`transport::Outgoing::kept`), so the write and its sync overlap the
 //! Ledger's own sync and no receiver finds a file the Ledger could lose
-//! (ADR-0018, amendment 2026-10-20). The directory is made only where it
-//! is not there, as the first file written in it finds.
+//! (ADR-0018, amendment 2026-10-20). Renamed, the directory is synced
+//! before the send is done — `fsync` of the directory on Unix,
+//! `FlushFileBuffers` of a handle to it on Windows — so the new name is on
+//! disk with the file's bytes, and a machine that stops after the send was
+//! acknowledged finds the file under its name, never the name it had before
+//! or none. The directory is made only where it is not there, as the first
+//! file written in it finds.
 //! A rename replaces what it lands on (`std::fs::rename`: `MoveFileExW`
 //! with `MOVEFILE_REPLACE_EXISTING` on Windows, `rename(2)` on Unix), so a
 //! send to a name already there replaces that file, as writing it did.
@@ -40,11 +45,12 @@ use transport::claim::Claimant;
 use transport::error::{Result, classify};
 
 /// `outgoing`'s body at `path`, whole or not at all, written beside it
-/// under a name `claimant` gives.
+/// under a name `claimant` gives, and on disk under its name.
 ///
 /// # Errors
 /// As the body could not be read, or the file system refused the write,
-/// the sync or the rename; the target is left as it was.
+/// the sync or the rename, and the target is left as it was; or the
+/// directory's sync after the rename, which a send again replaces.
 pub(crate) fn send(path: &Path, claimant: &Claimant, outgoing: &Outgoing<'_>) -> Result<()> {
     send_by(
         path,
@@ -83,12 +89,40 @@ fn send_by(
             file.sync_all().map_err(|e| refused(&e))
         })
         .and_then(|()| kept())
-        .and_then(|()| fs::rename(&sending, path).map_err(|e| refused(&e)));
+        .and_then(|()| fs::rename(&sending, path).map_err(|e| refused(&e)))
+        .and_then(|()| synced_directory(path).map_err(|e| refused(&e)));
     if written.is_err() {
         let _ = fs::remove_file(&sending);
     }
     drop(unfinished);
     written
+}
+
+/// The directory `path` is in synced: the names in it on disk as they are
+/// now. Windows syncs a directory through a handle to it opened for writing
+/// with `FILE_FLAG_BACKUP_SEMANTICS`, which `sync_all` flushes
+/// (`FlushFileBuffers`); Unix through the directory opened to read
+/// (`fsync`).
+fn synced_directory(path: &Path) -> io::Result<()> {
+    let directory = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let opened = cfg_select! {
+        windows => {{
+            use std::os::windows::fs::OpenOptionsExt;
+            /// `FILE_FLAG_BACKUP_SEMANTICS`: what opens a directory at all.
+            const BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            /// `GENERIC_WRITE`: what `FlushFileBuffers` asks of its handle.
+            const GENERIC_WRITE: u32 = 0x4000_0000;
+            File::options()
+                .access_mode(GENERIC_WRITE)
+                .custom_flags(BACKUP_SEMANTICS)
+                .open(directory)
+        }}
+        _ => File::open(directory),
+    };
+    opened?.sync_all()
 }
 
 /// `path` created new, and its directory with it where that is not there
@@ -154,6 +188,15 @@ mod tests {
 
         assert_eq!(fs::read(&target).expect("sent"), b"new", "replaced");
         assert_eq!(names(&dir), ["order.edi"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_directory_a_send_renames_in_is_synced() {
+        let dir = scratch("file-send-directory");
+        synced_directory(&dir.join("order.edi")).expect("the directory synced");
+        let missing = synced_directory(&dir.join("gone").join("order.edi"));
+        assert!(missing.is_err(), "a directory not there is not synced");
         let _ = fs::remove_dir_all(&dir);
     }
 
