@@ -26,8 +26,10 @@
 //! `FlushFileBuffers` of a handle to it on Windows — so the new name is on
 //! disk with the file's bytes, and a machine that stops after the send was
 //! acknowledged finds the file under its name, never the name it had before
-//! or none. The directory is made only where it is not there, as the first
-//! file written in it finds.
+//! or none. Both syncs wait through `xcore::spent::on_sync`: the disk's
+//! time, never Xmip's own share (ADR-0018, amendment 2026-11-09). The
+//! directory is made only where it is not there, as the first file written
+//! in it finds.
 //! A rename replaces what it lands on (`std::fs::rename`: `MoveFileExW`
 //! with `MOVEFILE_REPLACE_EXISTING` on Windows, `rename(2)` on Unix), so a
 //! send to a name already there replaces that file, as writing it did.
@@ -43,6 +45,7 @@ use std::path::Path;
 use transport::Outgoing;
 use transport::claim::Claimant;
 use transport::error::{Result, classify};
+use xcore::spent::on_sync;
 
 /// `outgoing`'s body at `path`, whole or not at all, written beside it
 /// under a name `claimant` gives, and on disk under its name.
@@ -86,7 +89,7 @@ fn send_by(
         .map_err(|e| refused(&e))
         .and_then(|mut file| {
             write(&mut file)?;
-            file.sync_all().map_err(|e| refused(&e))
+            on_sync(|| file.sync_all()).map_err(|e| refused(&e))
         })
         .and_then(|()| kept())
         .and_then(|()| fs::rename(&sending, path).map_err(|e| refused(&e)))
@@ -122,7 +125,8 @@ fn synced_directory(path: &Path) -> io::Result<()> {
         }}
         _ => File::open(directory),
     };
-    opened?.sync_all()
+    let opened = opened?;
+    on_sync(|| opened.sync_all())
 }
 
 /// `path` created new, and its directory with it where that is not there
