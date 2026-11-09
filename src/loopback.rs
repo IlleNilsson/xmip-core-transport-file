@@ -50,18 +50,27 @@ impl Loopback for FileTransport {
     }
 
     /// The directory a round drops into. Nothing waits: the round is in
-    /// order, so the file is whole when the far end lists it, and its
-    /// second listing takes it.
+    /// order, so the file is whole when the far end lists it, and the
+    /// listing that takes it is the round's.
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
         let directory = self.thread_directory();
         fs::create_dir_all(&directory)
             .map_err(|e| classify("creating the exchange directory", &e))?;
         Ok(Box::new(Held::new("round-trip", move || {
             let far = FileTransport::new(directory);
-            // The first listing finds the file; the stability check takes
-            // it at the second.
-            far.receive()?;
-            next_arrival(far.receive()?, "sent, but it did not come back")?.taken()
+            // The first listing takes the file where the system says no
+            // writer holds it (Windows); elsewhere it only finds it, and
+            // the stability check takes it at the second. What the first
+            // took is the round's: let go of, it went back to the
+            // directory to be claimed again, two renames more a round
+            // (2026-11-09).
+            let first = far.receive()?;
+            let arrivals = if first.is_empty() {
+                far.receive()?
+            } else {
+                first
+            };
+            next_arrival(arrivals, "sent, but it did not come back")?.taken()
         })))
     }
 
@@ -73,5 +82,26 @@ impl Loopback for FileTransport {
     /// first and the read-back finds it.
     fn exchanges_in_order(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_round_takes_back_what_it_sent_and_leaves_its_directory_empty() {
+        let root = std::env::temp_dir().join(format!("xmip-file-loopback-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let looped = FileTransport::loopback(&root);
+        for payload in [&b"ISA*00*one*"[..], b"ISA*00*two*"] {
+            let taken = looped.round(payload).expect("a round");
+            assert_eq!(taken.bytes, payload);
+        }
+        let left = fs::read_dir(looped.thread_directory())
+            .expect("its directory")
+            .count();
+        assert_eq!(left, 0, "nothing claimed, returned or left beside it");
+        let _ = fs::remove_dir_all(&root);
     }
 }
