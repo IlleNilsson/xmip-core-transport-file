@@ -176,10 +176,12 @@ order.edi.xmip-sending.<the node's location, percent-encoded>.<count in the proc
 ```
 
 A file already of the target's name is replaced: two Messages received under
-one name leave the last one's file. The rename waits until the Message is
-durable in the Ledger (`Outgoing::kept`, `Transport::holds_back`), so the
-write and its sync overlap the Ledger's own sync and no receiver finds a
-file the Ledger could lose (ADR-0018, amendment 2026-10-20). The directory
+one name leave the last one's file. The rename is its last step: it waits
+until what the Message is sent under — its Publication, or the claim the
+sending node took it from its queue under — is durable in the Ledger
+(`Outgoing::kept`, `Transport::holds_back`), so the write and its sync
+overlap the Ledger's own sync and no receiver finds a file the Ledger could
+lose (ADR-0018, amendments 2026-10-20 and 2026-11-12). The directory
 is made where the first file written there finds it missing. Where the
 write, the sync, the wait or the rename fails, or the Message cannot be
 read, the written file is removed and the target is left as it was.
