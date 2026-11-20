@@ -120,8 +120,8 @@ fn created(path: &Path) -> io::Result<File> {
 mod tests {
     use super::*;
     use crate::FileTransport;
+    use file::temporary::Folder;
     use std::io::{Read, Write};
-    use std::path::PathBuf;
     use transport::{Configured, NodeLocation};
     use xcore::settings::Applies;
 
@@ -132,14 +132,6 @@ mod tests {
 
     fn me() -> Claimant {
         Claimant::of(&node())
-    }
-
-    /// A fresh scratch directory.
-    fn scratch(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("xmip-{label}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("creating the scratch directory");
-        dir
     }
 
     /// The names in `dir`.
@@ -158,19 +150,18 @@ mod tests {
 
     #[test]
     fn a_sent_file_leaves_nothing_beside_it() {
-        let dir = scratch("file-send-whole");
+        let dir = Folder::new("file-send-whole");
         let target = dir.join("order.edi");
         send(&target, &me(), &Outgoing::held(b"old")).expect("sending");
         send(&target, &me(), &Outgoing::held(b"new")).expect("sending again");
 
         assert_eq!(fs::read(&target).expect("sent"), b"new", "replaced");
         assert_eq!(names(&dir), ["order.edi"]);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_failed_send_leaves_the_target_as_it_was() {
-        let dir = scratch("file-send-failed");
+        let dir = Folder::new("file-send-failed");
         let target = dir.join("order.edi");
         fs::write(&target, b"before").expect("a file already there");
 
@@ -188,7 +179,6 @@ mod tests {
         assert!(failed.is_err());
         assert_eq!(fs::read(&target).expect("still there"), b"before");
         assert_eq!(names(&dir), ["order.edi"], "the written file removed");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A body of `length` bytes made as it is read — byte `n` is `n % 251`
@@ -220,7 +210,7 @@ mod tests {
     #[test]
     fn a_body_is_written_a_piece_at_a_time_and_one_that_breaks_leaves_the_target() {
         const LENGTH: u64 = 4 * 1024 * 1024;
-        let dir = scratch("file-send-streamed");
+        let dir = Folder::new("file-send-streamed");
         let target = dir.join("order.edi");
         let largest = std::rc::Rc::new(std::cell::Cell::new(0));
         let made = |breaks| {
@@ -253,12 +243,11 @@ mod tests {
         assert!(broken.retryable, "{broken}");
         assert_eq!(fs::read(&target).expect("still there").len() as u64, LENGTH);
         assert_eq!(names(&dir), ["order.edi"], "the written file removed");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_node_starting_while_a_send_writes_leaves_the_sent_file_be() {
-        let dir = scratch("file-send-in-flight");
+        let dir = Folder::new("file-send-in-flight");
         let target = dir.join("order.edi");
         let address = |path: &Path| path.to_str().expect("a UTF-8 path").to_string();
         let (directory, sent_to) = (address(&dir), address(&target));
@@ -286,6 +275,5 @@ mod tests {
         sent.expect("sent whole");
         assert_eq!(fs::read(&target).expect("sent"), b"ISA*00*");
         assert_eq!(names(&dir), ["order.edi"]);
-        let _ = fs::remove_dir_all(&dir);
     }
 }

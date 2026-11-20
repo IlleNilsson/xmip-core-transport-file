@@ -91,8 +91,7 @@ mod tests {
 
     #[test]
     fn a_round_takes_back_what_it_sent_and_leaves_its_directory_empty() {
-        let root = std::env::temp_dir().join(format!("xmip-file-loopback-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = file::temporary::Folder::new("file-loopback");
         let looped = FileTransport::loopback(&root);
         for payload in [&b"ISA*00*one*"[..], b"ISA*00*two*"] {
             let taken = looped.round(payload).expect("a round");
@@ -102,6 +101,5 @@ mod tests {
             .expect("its directory")
             .count();
         assert_eq!(left, 0, "nothing claimed, returned or left beside it");
-        let _ = fs::remove_dir_all(&root);
     }
 }

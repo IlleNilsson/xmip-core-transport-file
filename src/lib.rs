@@ -330,26 +330,14 @@ impl Configured for FileTransport {
 mod tests {
     use super::*;
     use context::property::FILE_MODE;
+    use file::temporary::Folder;
     use std::collections::BTreeSet;
     use std::fs;
     use std::io::Write;
-    use std::time::{SystemTime, UNIX_EPOCH};
     use transport::Refusal;
     use transport::claim::{Artifact, Claimant};
     use transport::loopback::Loopback;
     use xcore::settings::Applies;
-
-    fn scratch(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock before epoch")
-            .as_nanos();
-
-        let dir = std::env::temp_dir().join(format!("xmip-{label}-{}-{nanos}", std::process::id()));
-        fs::create_dir_all(&dir).expect("creating the scratch directory");
-
-        dir
-    }
 
     /// A node location for the node at `place`. It names no node: the test
     /// cluster's names (`configure::fixture`) are not this crate's to
@@ -437,7 +425,8 @@ mod tests {
 
     #[test]
     fn file_transport_declares_both_directions_and_claims_its_files() {
-        let transport = FileTransport::new(std::env::temp_dir());
+        let dir = Folder::new("file-declares");
+        let transport = FileTransport::new(&dir);
 
         assert!(transport.directions().receives());
         assert!(transport.directions().sends());
@@ -447,7 +436,8 @@ mod tests {
 
     #[test]
     fn file_receive_is_empty_when_the_directory_is_absent() {
-        let transport = FileTransport::new(std::env::temp_dir().join("xmip-definitely-not-here"));
+        let dir = Folder::new("file-absent");
+        let transport = FileTransport::new(dir.join("not-here"));
 
         assert!(
             transport
@@ -459,7 +449,7 @@ mod tests {
 
     #[test]
     fn file_round_trip_carries_bytes_and_origin() {
-        let dir = scratch("file-round-trip");
+        let dir = Folder::new("file-round-trip");
         let transport = FileTransport::new(&dir);
 
         transport
@@ -477,13 +467,11 @@ mod tests {
             "the origin is the dropped name: {}",
             taken.origin_uri
         );
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_file_still_being_sent_is_never_received() {
-        let dir = scratch("file-sending");
+        let dir = Folder::new("file-sending");
         let transport = FileTransport::new(&dir);
         let writing = Claimant::of(&node(1)).sending("order.edi");
         let sending = dir.join(writing.name());
@@ -496,12 +484,11 @@ mod tests {
 
         transport.send("order.edi", b"ISA*00*").expect("sending");
         assert_eq!(the_one(&transport), b"ISA*00*");
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_file_uri_uses_forward_slashes_everywhere() {
-        let dir = scratch("file-uri");
+        let dir = Folder::new("file-uri");
         let transport = FileTransport::new(&dir);
 
         transport.send("order.edi", b"x").expect("sending");
@@ -514,12 +501,11 @@ mod tests {
         );
 
         drop(arrived);
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_claimed_file_is_renamed_to_a_name_recording_its_node() {
-        let dir = scratch("file-claimed");
+        let dir = Folder::new("file-claimed");
         let transport = on(&dir, 0);
         transport.send("order.edi", b"ISA*00*").expect("sending");
 
@@ -542,13 +528,12 @@ mod tests {
             BTreeSet::from(["order.edi".to_string()]),
             "let go without a verdict, it is returned"
         );
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn two_receivers_over_one_folder_take_each_file_once() {
         const FILES: usize = 200;
-        let dir = scratch("file-two-receivers");
+        let dir = Folder::new("file-two-receivers");
         let sender = FileTransport::new(&dir);
         for file in 0..FILES {
             sender
@@ -557,7 +542,7 @@ mod tests {
         }
 
         let receivers = [on(&dir, 0), on(&dir, 1)];
-        let dir = dir.as_path();
+        let dir: &Path = &dir;
         let took: Vec<Vec<String>> = std::thread::scope(|scope| {
             let running: Vec<_> = receivers
                 .iter()
@@ -584,12 +569,11 @@ mod tests {
         let once: BTreeSet<&String> = all.iter().copied().collect();
         assert_eq!(all.len(), FILES, "every file taken, none twice");
         assert_eq!(once.len(), FILES);
-        fs::remove_dir_all(dir).ok();
     }
 
     #[test]
     fn a_receive_claims_no_more_than_it_was_given_room_for_and_leaves_the_rest() {
-        let dir = scratch("file-room");
+        let dir = Folder::new("file-room");
         let sender = FileTransport::new(&dir);
         for file in 0..10 {
             sender
@@ -625,13 +609,12 @@ mod tests {
             }
         }
         assert!(names(&dir).is_empty(), "every file taken in its turn");
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     #[cfg(windows)]
     fn a_file_a_writer_holds_is_never_taken_and_one_let_go_is_taken_at_once() {
-        let dir = scratch("file-held");
+        let dir = Folder::new("file-held");
         let transport = on(&dir, 0);
         let mut producer = File::create(dir.join("order.edi")).expect("a producer");
         producer.write_all(b"ISA*00*").expect("writing");
@@ -647,12 +630,11 @@ mod tests {
         for one in arrived {
             one.taken().expect("accepted");
         }
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_file_still_growing_is_not_taken_until_it_stops() {
-        let dir = scratch("file-growing");
+        let dir = Folder::new("file-growing");
         let transport = on(&dir, 0);
         let mut producer = File::create(dir.join("order.edi")).expect("a producer");
         producer.write_all(b"ISA*00*").expect("writing");
@@ -675,12 +657,11 @@ mod tests {
         );
         let taken = arrived.remove(0).taken().expect("taken");
         assert_eq!(taken.bytes, b"ISA*00*GS*PO*", "taken whole");
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_refused_file_is_returned_and_not_received_again_until_written_again() {
-        let dir = scratch("file-refused");
+        let dir = Folder::new("file-refused");
         let transport = on(&dir, 0);
         transport.send("order.edi", b"ISA*00*").expect("sending");
         let mut arrived = settled(&transport);
@@ -705,12 +686,11 @@ mod tests {
             .send("order.edi", b"ISA*00*ZZ*")
             .expect("written again");
         assert_eq!(settled(&transport).len(), 1, "written again, it is new");
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_failed_file_is_returned_and_an_accepted_one_is_deleted() {
-        let dir = scratch("file-verdict");
+        let dir = Folder::new("file-verdict");
         let transport = on(&dir, 0);
         transport.send("order.edi", b"ISA*00*").expect("sending");
 
@@ -734,8 +714,6 @@ mod tests {
         assert_eq!(taken.bytes, b"ISA*00*");
         assert!(names(&dir).is_empty(), "an accepted file is deleted");
         assert!(transport.receive().expect("receiving").is_empty());
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// The bytes of the one arrival two listings of `transport` take.
@@ -747,7 +725,7 @@ mod tests {
 
     #[test]
     fn a_return_kept_from_its_name_goes_back_once_the_newer_file_is_consumed() {
-        let dir = scratch("file-held-accepted");
+        let dir = Folder::new("file-held-accepted");
         let transport = on(&dir, 0);
         transport.send("order.edi", b"old").expect("sending");
         let mut arrived = settled(&transport);
@@ -770,12 +748,11 @@ mod tests {
         );
         assert_eq!(transport.held(), [] as [Held; 0]);
         assert_eq!(the_one(&transport), b"old", "and is received again");
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_refused_return_kept_from_its_name_goes_back_refused_once_it_is_free() {
-        let dir = scratch("file-held-refused");
+        let dir = Folder::new("file-held-refused");
         let transport = on(&dir, 0);
         transport.send("order.edi", b"old").expect("sending");
         let mut arrived = settled(&transport);
@@ -802,12 +779,11 @@ mod tests {
             b"old",
             "another node finds it, not lost"
         );
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_starting_node_holds_a_claim_whose_name_is_taken_until_it_is_free() {
-        let dir = scratch("file-held-start");
+        let dir = Folder::new("file-held-start");
         let sender = FileTransport::new(&dir);
         sender.send("order.edi", b"old").expect("sending");
         std::mem::forget(settled(&on(&dir, 0)));
@@ -825,12 +801,11 @@ mod tests {
         );
         assert_eq!(the_one(&restarted), b"old");
         assert!(names(&dir).is_empty());
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_starting_node_returns_the_claims_its_name_left_and_no_others() {
-        let dir = scratch("file-dead-owner");
+        let dir = Folder::new("file-dead-owner");
         let sender = FileTransport::new(&dir);
         sender.send("mine.edi", b"ISA*00*").expect("sending");
         let mut held = settled(&on(&dir, 0));
@@ -863,7 +838,6 @@ mod tests {
             b"ISA*00*"
         );
         assert_eq!(settled(&restarted).len(), 1, "and received again");
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// A file `place`'s node left half sent to `target` in `dir`: a send
@@ -879,7 +853,7 @@ mod tests {
 
     #[test]
     fn a_starting_node_removes_the_sends_it_left_in_its_drop_directory_and_no_others() {
-        let dir = scratch("file-left-receive");
+        let dir = Folder::new("file-left-receive");
         let mine = left_half_sent(&dir, 0, "order.edi");
         let theirs = left_half_sent(&dir, 1, "order.edi");
         FileTransport::new(&dir)
@@ -894,12 +868,11 @@ mod tests {
         let mut arrived = settled(&restarted);
         assert_eq!(arrived.len(), 1, "a half sent file is never an arrival");
         assert_eq!(arrived.remove(0).taken().expect("taken").bytes, b"ISA*00*");
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_starting_send_location_removes_what_its_node_left_in_its_directory() {
-        let dir = scratch("file-left-send");
+        let dir = Folder::new("file-left-send");
         let target = dir.join("billing.edi");
         fs::write(&target, b"sent before").expect("a file sent before");
         let mine = left_half_sent(&dir, 0, "billing.edi");
@@ -916,7 +889,6 @@ mod tests {
         sending.send("billing.edi", b"ISA*00*").expect("sending");
         assert_eq!(fs::read(&target).expect("sent"), b"ISA*00*");
         assert_eq!(names(&dir).len(), 2, "{:?}", names(&dir));
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// A Message's context, received as the file `name`.
@@ -927,7 +899,7 @@ mod tests {
 
     #[test]
     fn a_message_is_written_in_the_directory_under_the_name_it_was_received_under() {
-        let dir = scratch("file-send-named");
+        let dir = Folder::new("file-send-named");
         let address = dir.join("out");
         let address = address.to_str().expect("a UTF-8 path");
         let sending = FileTransport::open(address, Applies::Send, &[])
@@ -953,12 +925,11 @@ mod tests {
             relative.sent_to("out", &held).expect("named"),
             Path::new("out").join("order-1001.edi")
         );
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_message_with_no_file_name_or_a_path_for_one_is_refused_in_words() {
-        let dir = scratch("file-send-unnamed");
+        let dir = Folder::new("file-send-unnamed");
         let sending = FileTransport::new(&dir);
         let unnamed = context::MessageContext::new();
         let outgoing = transport::Outgoing::held(b"ISA").carrying(&unnamed);
@@ -977,12 +948,11 @@ mod tests {
             );
         }
         assert!(names(&dir).is_empty(), "{:?}", names(&dir));
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_message_with_no_file_name_is_named_by_the_pattern_or_its_identifier() {
-        let dir = scratch("file-send-pattern");
+        let dir = Folder::new("file-send-pattern");
         let unnamed = context::MessageContext::new();
         let message = "0199f0a1-7c2e-7000-8000-000000000001";
         let outgoing = || {
@@ -1021,24 +991,22 @@ mod tests {
             refused.message
         );
         assert_eq!(names(&dir).len(), 3, "{:?}", names(&dir));
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_dropped_file_says_the_name_it_was_dropped_under() {
-        let dir = scratch("file-dropped-name");
+        let dir = Folder::new("file-dropped-name");
         let transport = FileTransport::new(&dir);
         transport.send("order-7.edi", b"ISA").expect("sending");
 
         let mut arrived = settled(&transport);
         let taken = arrived.remove(0).taken().expect("taken");
         assert_eq!(taken.observation(FILE_NAME), Some("order-7.edi"));
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_round_says_who_owns_the_file_where_the_system_says() {
-        let dir = scratch("file-round-identity");
+        let dir = Folder::new("file-round-identity");
         let taken = FileTransport::loopback(&dir)
             .round(b"who sent this")
             .expect("a round");
@@ -1049,6 +1017,5 @@ mod tests {
             cfg!(unix),
             "{taken:?}"
         );
-        fs::remove_dir_all(&dir).ok();
     }
 }
