@@ -34,6 +34,10 @@ codec = { package = "xmip-core-library-codec", git = "https://github.com/IlleNil
 # The directory synced after a send's rename, written once for the estate.
 file = { package = "xmip-core-library-file", git = "https://github.com/IlleNilsson/xmip-core-library-file", branch = "main" }
 
+[dev-dependencies]
+# A test's own temporary folder (`file::temporary`); for the tests only.
+file = { package = "xmip-core-library-file", git = "https://github.com/IlleNilsson/xmip-core-library-file", branch = "main", features = ["test-support"] }
+
 [lints.rust]
 unsafe_code = "forbid"
 

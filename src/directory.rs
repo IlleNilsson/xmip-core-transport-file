@@ -249,22 +249,21 @@ fn restore_by(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use file::temporary::Folder;
     use std::assert_matches;
 
-    /// A claimed file `order.edi` in a fresh scratch directory, holding
+    /// A claimed file `order.edi` in a folder of its own, holding
     /// `claimed`.
-    fn claimed_in(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("xmip-{label}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("creating the scratch directory");
+    fn claimed_in(label: &str) -> (Folder, PathBuf) {
+        let dir = Folder::new(label);
         let claimed = dir.join("order.edi.xmip-claim.process-1.1");
         fs::write(&claimed, b"claimed").expect("writing the claimed file");
-        claimed
+        (dir, claimed)
     }
 
     #[test]
     fn a_name_taken_before_the_return_is_never_replaced() {
-        let claimed = claimed_in("file-give-back-taken");
+        let (_folder, claimed) = claimed_in("file-give-back-taken");
         let dropped = claimed.with_file_name("order.edi");
         fs::write(&dropped, b"newer").expect("a producer drops a newer file");
 
@@ -277,12 +276,11 @@ mod tests {
         );
         assert_eq!(fs::read(&dropped).expect("the newer file"), b"newer");
         assert_eq!(fs::read(&claimed).expect("still claimed"), b"claimed");
-        let _ = fs::remove_dir_all(claimed.parent().expect("its directory"));
     }
 
     #[test]
     fn without_hard_links_a_name_taken_during_the_return_is_never_replaced() {
-        let claimed = claimed_in("file-give-back-no-link");
+        let (_folder, claimed) = claimed_in("file-give-back-no-link");
         let dropped = claimed.with_file_name("order.edi");
 
         // The file system makes no link, and a producer drops a newer file
@@ -299,12 +297,11 @@ mod tests {
         );
         assert_eq!(fs::read(&dropped).expect("the newer file"), b"newer");
         assert_eq!(fs::read(&claimed).expect("still claimed"), b"claimed");
-        let _ = fs::remove_dir_all(claimed.parent().expect("its directory"));
     }
 
     #[test]
     fn a_turn_is_had_once_and_says_who_holds_it() {
-        let claimed = claimed_in("file-turn");
+        let (_folder, claimed) = claimed_in("file-turn");
         let directory = Directory::at(claimed.parent().expect("its directory"));
         assert!(
             directory
@@ -328,7 +325,6 @@ mod tests {
             .drop_turn("order.edi.xmip-claim", "one")
             .expect("dropped");
         assert_eq!(directory.turns().expect("listed"), [] as [String; 0]);
-        let _ = fs::remove_dir_all(&directory.root);
     }
 
     /// On Windows a dropped file's turn is the file held open: had by one
@@ -337,7 +333,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_dropped_files_turn_is_the_file_held_open() {
-        let claimed = claimed_in("file-held-turn");
+        let (_folder, claimed) = claimed_in("file-held-turn");
         let root = claimed.parent().expect("its directory").to_path_buf();
         fs::write(root.join("order.edi"), b"dropped").expect("dropped");
         let (one, two) = (Directory::at(&root), Directory::at(&root));
@@ -371,6 +367,5 @@ mod tests {
         );
         one.drop_turn("being-written.edi.xmip-claim", "one")
             .expect("let go");
-        let _ = fs::remove_dir_all(&root);
     }
 }
