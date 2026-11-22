@@ -42,10 +42,11 @@ producer still writes, paused or not, is never taken (ADR-0024, amendment
 takes a file only where its length and modification time are what the
 listing before found — clause 5's stability check — so a file a producer is
 still writing is left until it stops growing. It is then claimed by renaming
-it to a name recording the node and the time (the amendment of 2026-09-26):
+it to a name recording the node, which start of it claimed, and the time
+(the amendments of 2026-09-26 and 2026-11-22):
 
 ```text
-order.edi.xmip-claim.<the node's location, percent-encoded>.<nanoseconds since 1970>
+order.edi.xmip-claim.<the node's location, percent-encoded>~<its start, 32 hexadecimal digits>.<nanoseconds since 1970>
 ```
 
 Two renames of one file are not exclusive — Windows renames through a handle
@@ -74,11 +75,13 @@ any finished file, so a directory of thousands is claimed as the Location's
 pool and the node have room, never all at once. Until 2026-10-19 a
 listing claimed every finished file it found.
 
-The node is the one the runtime names as it builds the transport
-(`transport::Configured::on_node`, the owner's *Option A*, 2026-10-03), and
-a node that starts returns to the drop directory every claim its name still
-records there, and removes any turn it held and any file its sends left
-half sent there (*Send*, below): whatever it held before, nothing holds now.
+The node and its start are the ones the runtime names as it builds the
+transport (`transport::Configured::on_node`, the owner's *Option A*,
+2026-10-03), and a node that starts returns to the drop directory every
+claim its earlier starts still record there, and removes any turn they held
+and any file their sends left half sent there (*Send*, below): whatever
+they held, nothing holds now. What this start holds through another
+Location over the same directory is left (ADR-0024, amendment 2026-11-22).
 A file returned is linked back under its dropped name, never over
 a file dropped there since; where one was, it waits (below). A
 transport built outside a node — a loopback, a test — claims in its
@@ -168,11 +171,12 @@ Ledger, a piece at a time and never whole in memory (`Sending::Streamed`,
 2026-10-19), in the same directory, under a name no listing takes, then
 syncs it and renames it over the target in one step, so a receiver finds
 the target as it was before or whole, never half written. The name carries
-the node that writes it, as a claimed name does (`transport::claim`'s
-`Claimant::sending`; ADR-0024, amendment 2026-10-19):
+the node that writes it and its start, as a claimed name does
+(`transport::claim`'s `Claimant::sending`; ADR-0024, amendments 2026-10-19
+and 2026-11-22):
 
 ```text
-order.edi.xmip-sending.<the node's location, percent-encoded>.<count in the process>.<nanoseconds since 1970>
+order.edi.xmip-sending.<the node's location, percent-encoded>~<its start>.<count in the process>.<nanoseconds since 1970>
 ```
 
 A file already of the target's name is replaced: two Messages received under
@@ -190,10 +194,11 @@ it half written.
 
 A process that dies between the write and the rename leaves the written
 file. Its node removes it as it starts again (the owner, 2026-10-19): a Send
-Location removes what its node's sends left in the directory its address
-names; a Receive Location removes what they left in
+Location removes what its node's earlier starts' sends left in the directory
+its address names; a Receive Location removes what they left in
 its drop directory while it returns its claims. Another node's file is never
-removed, nor one a send of the same process is still writing. The address
+removed, nor one this start wrote, nor one a send of the same process is
+still writing. The address
 means one thing to a receive and another to a send, so the transport learns
 its side as it is built (`transport::Configured::sided`). Until 2026-10-19
 the name carried the process, and such a file stayed for good; and a Send

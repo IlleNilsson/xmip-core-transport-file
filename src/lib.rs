@@ -12,14 +12,15 @@
 //! listing takes a file only where its length and modification time are
 //! what the listing before found — the stability check — so a file a
 //! producer is still writing is left until it stops growing; it is then
-//! claimed by taking its turn and renaming it to a name recording the node
-//! and the time, and whichever node's rename succeeds has it. The node is
-//! the one the runtime names as it builds the transport
-//! ([`Configured::on_node`]), and a node that starts returns to the drop
-//! directory whatever its name still holds there, since nothing holds it
-//! now, and removes what its sends left half sent (`sending.rs`; ADR-0024,
-//! amendment 2026-10-19). How a file system takes each step is
-//! `directory.rs`.
+//! claimed by taking its turn and renaming it to a name recording the node,
+//! which start of it claimed, and the time, and whichever node's rename
+//! succeeds has it. The node and its start are the ones the runtime names
+//! as it builds the transport ([`Configured::on_node`]), and a node that
+//! starts returns to the drop directory whatever its earlier starts still
+//! hold there, since nothing holds it now, and removes what their sends
+//! left half sent (`sending.rs`; ADR-0024, amendments 2026-10-19 and
+//! 2026-11-22); what its own start holds through another Location is left.
+//! How a file system takes each step is `directory.rs`.
 //!
 //! **A file is consumed only on its verdict.** `receive` hands each claimed
 //! file back as a reader over it, opened as the runtime first reads it; the
@@ -52,7 +53,7 @@ use context::property::FILE_NAME;
 use transport::Arrived;
 use transport::Configured;
 use transport::Directions;
-use transport::NodeLocation;
+use transport::NodeStart;
 use transport::Transport;
 use transport::body::opened;
 use transport::claim::{Claimant, Claiming, Held, ResourceClaim, Site, Sited};
@@ -303,18 +304,20 @@ impl Configured for FileTransport {
         }
     }
 
-    /// Claims made, and sent files named, in `node`'s name from here on;
-    /// what that name left before, recovered: the node is starting, so
-    /// whatever it held or was writing before, nothing holds now (ADR-0024,
-    /// amendments 2026-09-26 and 2026-10-19). A Receive Location returns
-    /// every claim the name still holds in its drop directory — one whose
+    /// Claims made, and sent files named, in the name of `node`, its node
+    /// and that start of it, from here on; what the node's earlier starts
+    /// left, recovered: the node started again, so whatever they held or
+    /// were writing, nothing holds now (ADR-0024, amendments 2026-09-26,
+    /// 2026-10-19 and 2026-11-22). A Receive Location returns every claim
+    /// an earlier start still holds in its drop directory — one whose
     /// dropped name a newer file has taken is held until the name is free
-    /// — and removes its turns and the sent files its sends left
+    /// — and removes their turns and the sent files their sends left
     /// unfinished there. A Send Location claims nothing, and removes the
-    /// sent files its node's sends left unfinished in the directory it
-    /// writes in. Another node's file is never touched, nor one a send of
+    /// sent files its node's earlier starts left unfinished in the
+    /// directory it writes in. Another node's file is never touched, nor
+    /// one this start holds through another Location, nor one a send of
     /// this process is still writing.
-    fn on_node(mut self, node: &NodeLocation) -> Result<Self> {
+    fn on_node(mut self, node: &NodeStart) -> Result<Self> {
         self.claiming = Claiming::new(Claimant::of(node));
         if self.sends {
             let claimant = self.claiming.claimant();
@@ -339,19 +342,27 @@ mod tests {
     use transport::loopback::Loopback;
     use xcore::settings::Applies;
 
-    /// A node location for the node at `place`. It names no node: the test
-    /// cluster's names (`configure::fixture`) are not this crate's to
-    /// depend on, and a claim compares the location whole, never reads it.
-    fn node(place: usize) -> NodeLocation {
-        NodeLocation::new(format!("process-{}/place-{place}", std::process::id()))
+    /// A start of the node at `place`, after every start before it. Its
+    /// location names no node: the test cluster's names
+    /// (`configure::fixture`) are not this crate's to depend on, and a
+    /// claim compares the location whole, never reads it.
+    fn node(place: usize) -> NodeStart {
+        let location = format!("process-{}/place-{place}", std::process::id());
+        NodeStart::next(transport::NodeLocation::new(location))
     }
 
-    /// A Receive Location at `dir` on the node at `place`, built as the
-    /// runtime builds it.
+    /// A Receive Location at `dir` on a start of the node at `place`, after
+    /// every start before it, built as the runtime builds it.
     fn on(dir: &Path, place: usize) -> FileTransport {
+        on_start(dir, &node(place))
+    }
+
+    /// A Receive Location at `dir` on `start`, built as the runtime builds
+    /// it.
+    fn on_start(dir: &Path, start: &NodeStart) -> FileTransport {
         let address = dir.to_str().expect("a UTF-8 path");
         FileTransport::open(address, Applies::Receive, &[])
-            .and_then(|transport| transport.on_node(&node(place)))
+            .and_then(|transport| transport.on_node(start))
             .expect("built on its node")
     }
 
@@ -514,11 +525,11 @@ mod tests {
         let held = names(&dir);
         assert!(!held.contains("order.edi"), "claimed, it is gone: {held:?}");
         let claimed = held.iter().next().expect("the claimed file");
-        let encoded = codec::percent::encode_keeping(node(0).as_str(), |byte| {
+        let encoded = codec::percent::encode_keeping(node(0).location().as_str(), |byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
         });
         assert!(
-            claimed.starts_with(&format!("order.edi.xmip-claim.{encoded}.")),
+            claimed.starts_with(&format!("order.edi.xmip-claim.{encoded}~")),
             "{claimed}"
         );
 
@@ -838,6 +849,28 @@ mod tests {
             b"ISA*00*"
         );
         assert_eq!(settled(&restarted).len(), 1, "and received again");
+    }
+
+    #[test]
+    fn a_location_built_beside_a_live_one_of_its_start_leaves_what_that_one_holds() {
+        let dir = Folder::new("file-one-start");
+        FileTransport::new(&dir)
+            .send("order.edi", b"ISA*00*")
+            .expect("sending");
+        let start = node(0);
+        let held = settled(&on_start(&dir, &start));
+        assert_eq!(held.len(), 1, "the first Location's, unacknowledged");
+
+        let second = on_start(&dir, &start);
+        assert!(settled(&second).is_empty(), "not taken again");
+        let left = names(&dir);
+        assert!(
+            left.iter().all(|name| name.contains(".xmip-claim.")),
+            "still the first's: {left:?}"
+        );
+        let taken = held.into_iter().next().expect("held").taken();
+        assert_eq!(taken.expect("taken").bytes, b"ISA*00*");
+        assert!(names(&dir).is_empty(), "{:?}", names(&dir));
     }
 
     /// A file `place`'s node left half sent to `target` in `dir`: a send

@@ -6,11 +6,11 @@
 //! no listing takes it, and named for the node that writes it
 //! (`transport::claim::Claimant::sending`; ADR-0024, amendment
 //! 2026-10-19): the target's name, the mark `.xmip-sending.`, the node's
-//! location percent-encoded, a count of the process's sends and the time
-//! in nanoseconds since the Unix epoch:
+//! location percent-encoded and which start of it sends, a count of the
+//! process's sends and the time in nanoseconds since the Unix epoch:
 //!
 //! ```text
-//! order.edi.xmip-sending.xmip%3A%2F%2F%2F<cluster>%2Fnode%2F<node>.7.1790000000123456789
+//! order.edi.xmip-sending.xmip%3A%2F%2F%2F<cluster>%2Fnode%2F<node>~<start>.7.1790000000123456789
 //! ```
 //!
 //! The body is written as it is read, a piece at a time from the Ledger
@@ -36,7 +36,8 @@
 //! Where anything fails, the written file is removed and the target is left
 //! as it was. A process that dies between the write and the rename leaves
 //! the file; its node removes it as it starts again
-//! (`FileTransport::on_node`), and no other node touches it.
+//! (`FileTransport::on_node`), and no other node, nor another Location of
+//! the same start, touches it (ADR-0024, amendment 2026-11-22).
 
 use std::fs::{self, File};
 use std::io;
@@ -122,12 +123,16 @@ mod tests {
     use crate::FileTransport;
     use file::temporary::Folder;
     use std::io::{Read, Write};
-    use transport::{Configured, NodeLocation};
+    use transport::{Configured, NodeLocation, NodeStart};
     use xcore::settings::Applies;
 
-    /// The node these sends are made on.
-    fn node() -> NodeLocation {
-        NodeLocation::new(format!("process-{}/place-0", std::process::id()))
+    /// A start of the node these sends are made on, after every start
+    /// before it.
+    fn node() -> NodeStart {
+        NodeStart::next(NodeLocation::new(format!(
+            "process-{}/place-0",
+            std::process::id()
+        )))
     }
 
     fn me() -> Claimant {
