@@ -39,30 +39,45 @@
 //! claimed name with why ([`FileTransport::held`]), and goes back as soon
 //! as the name is free: once this Location consumes the newer file, or at
 //! the next receive.
+//!
+//! **Built with its `declaration` feature alone** the crate is
+//! [`declaration`], what a Location of it is configured with, and none of
+//! the code above, which is behind the default feature: what the surfaces'
+//! library carries (ADR-0064, amendment 2026-11-26).
 
+#[cfg(feature = "declaration")]
+pub mod declaration;
+#[cfg(feature = "default")]
 mod directory;
-#[cfg(windows)]
+#[cfg(all(windows, feature = "default"))]
 mod holding;
+#[cfg(feature = "default")]
 mod loopback;
+#[cfg(feature = "default")]
 mod sending;
 
+#[cfg(feature = "default")]
 use std::fs::File;
+#[cfg(feature = "default")]
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "default")]
 use context::property::FILE_NAME;
-use transport::Arrived;
-use transport::Configured;
-use transport::Directions;
-use transport::NodeStart;
-use transport::Transport;
-use transport::body::opened;
+#[cfg(feature = "default")]
 use transport::claim::{Claimant, Claiming, Held, ResourceClaim, Site, Sited};
+#[cfg(feature = "default")]
 use transport::error::{Result, classify};
-use transport::file_name::file_name;
-use xcore::settings::{Applies, Kind, Presence, Read, Setting, Settings};
+#[cfg(feature = "default")]
+use transport::{
+    Arrived, Configured, Directions, NodeStart, Transport, body::opened, file_name::file_name,
+};
+#[cfg(feature = "default")]
+use xcore::settings::{Applies, Read, Settings};
 
+#[cfg(feature = "default")]
 pub use crate::directory::{Directory, Stamp};
 
+#[cfg(feature = "default")]
 pub struct FileTransport {
     directory: Directory,
     /// The claims made here, the stability check's memory, the refused
@@ -78,6 +93,7 @@ pub struct FileTransport {
     pattern: Option<String>,
 }
 
+#[cfg(feature = "default")]
 impl FileTransport {
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -149,6 +165,7 @@ impl FileTransport {
     }
 }
 
+#[cfg(feature = "default")]
 cfg_select! {
     unix => {
         /// Who owns the file at `path` and what it permits, as the system
@@ -177,6 +194,7 @@ cfg_select! {
     }
 }
 
+#[cfg(feature = "default")]
 impl Transport for FileTransport {
     fn name(&self) -> &'static str {
         "file"
@@ -238,6 +256,7 @@ impl Transport for FileTransport {
 
 /// The claim [`FileTransport::receive`] takes, for a caller holding one
 /// file by its address, a path or its name in the directory.
+#[cfg(feature = "default")]
 impl Sited for FileTransport {
     type Stamp = Stamp;
 
@@ -250,26 +269,10 @@ impl Sited for FileTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Configured for FileTransport {
-    /// The address is the directory: a Receive Location's drop directory, a
-    /// Send Location's directory it writes each Message's file in. A Send
-    /// Location's `name` names the file of a Message carrying no
-    /// `file.name`.
-    const SETTINGS: &'static Settings = &Settings {
-        technology: env!("CARGO_PKG_NAME"),
-        settings: &[Setting {
-            name: "name",
-            kind: Kind::Text,
-            presence: Presence::Optional,
-            meaning: "The file name a Message carrying no file.name is written under, \
-                      {message} in it the Message's identifier; the identifier alone when \
-                      left out.",
-            applies: Applies::Send,
-        }],
-    };
-
-    /// `file://`, and a path entered with no scheme at all (RFC 8089).
-    const SCHEMES: &'static [&'static str] = &["file"];
+    const SETTINGS: &'static Settings = declaration::SETTINGS;
+    const SCHEMES: &'static [&'static str] = declaration::SCHEMES;
 
     /// The directory a `file://` address names (RFC 8089): `file:///var/drop`
     /// is `/var/drop`, `file:///C:/drop` is `C:/drop`, `file://host/share`
