@@ -16,20 +16,20 @@ path = "src/lib.rs"
 # vocabulary and the line-oriented wire helpers live there. Standard library
 # otherwise, which is what lets this build on every target in
 # deployment-model.md without a cross-compilation story.
-transport = { package = "xmip-core-transport", git = "https://github.com/IlleNilsson/xmip-core-transport", branch = "main", optional = true }
+transport = { workspace = true, optional = true }
 # The names what this technology observed of a sender travels under, which
 # the identity gates read (`context::property`, ADR-0019 amendment
 # 2026-10-06).
-context = { package = "xmip-core-context", git = "https://github.com/IlleNilsson/xmip-core-context", branch = "main", optional = true }
+context = { workspace = true, optional = true }
 # The settings this technology declares (xcore::settings), read through
 # transport::Configured (ADR-0064, amendment 2026-09-26).
-xcore = { package = "xmip-core", git = "https://github.com/IlleNilsson/xmip-core", branch = "main" }
+xcore = { workspace = true }
 # A filesystem path as the path of a URI, written once for the estate.
-net = { package = "xmip-core-library-net", git = "https://github.com/IlleNilsson/xmip-core-library-net", branch = "main", optional = true }
+net = { workspace = true, optional = true }
 # Percent-encoding, written and read once for the estate.
-codec = { package = "xmip-core-library-codec", git = "https://github.com/IlleNilsson/xmip-core-library-codec", branch = "main", optional = true }
+codec = { workspace = true, optional = true }
 # The directory synced after a send's rename, written once for the estate.
-file = { package = "xmip-core-library-file", git = "https://github.com/IlleNilsson/xmip-core-library-file", branch = "main", optional = true }
+file = { workspace = true, optional = true }
 
 [features]
 # The code and its declaration: the transport guide's "The declaration",
@@ -40,10 +40,10 @@ declaration = []
 
 [dev-dependencies]
 # A test's own temporary folder (`file::temporary`); for the tests only.
-file = { package = "xmip-core-library-file", git = "https://github.com/IlleNilsson/xmip-core-library-file", branch = "main", features = ["test-support"] }
+file = { workspace = true, features = ["test-support"] }
 # A node started again, as a test builds it (`transport::NodeStart::next`),
 # from the capability's test support and never a production build.
-transport = { package = "xmip-core-transport", git = "https://github.com/IlleNilsson/xmip-core-transport", branch = "main", features = ["test-support"] }
+transport = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true
